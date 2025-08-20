@@ -22,21 +22,15 @@ POST /render (auth required)
 Body:
 
 json
-Kopieren
-Bearbeiten
 { "url": "https://example.com", "device": "iphone_15_pro" }
 Header:
 
 pgsql
-Kopieren
-Bearbeiten
 Authorization: Bearer <RENDER_TOKEN>
 Content-Type: application/json
 Response (abridged)
 
 json
-Kopieren
-Bearbeiten
 {
   "device": "iphone_15_pro",
   "deviceMeta": { "viewport": { "width": 393, "height": 852 }, "dpr": 3, "ua": "..." },
@@ -89,8 +83,6 @@ Settings → Health Check Path = /health.
 Test:
 
 bash
-Kopieren
-Bearbeiten
 curl -s https://<service>.onrender.com/health
 curl -s -X POST https://<service>.onrender.com/render \
   -H "Authorization: Bearer <RENDER_TOKEN>" \
@@ -100,8 +92,6 @@ Run locally with Docker
 Requires Docker. Using the Playwright image avoids OS deps headaches.
 
 bash
-Kopieren
-Bearbeiten
 # build
 docker build -t foldy-render:local .
 
@@ -134,8 +124,6 @@ We block heavy 3rd-party scripts (analytics/video) to stabilize renders.
 
 Project structure
 pgsql
-Kopieren
-Bearbeiten
 .
 ├── Dockerfile
 ├── index.js
@@ -145,9 +133,6 @@ License
 MIT (or your choice)
 
 perl
-Kopieren
-Bearbeiten
-
 ---
 
 ### `.github/pull_request_template.md`
@@ -217,6 +202,3 @@ Follow-ups (optional)
 
 Screenshots (optional)
 <!-- Paste any relevant terminal output or screenshots -->
-perl
-Kopieren
-Bearbeiten
