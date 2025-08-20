@@ -163,8 +163,7 @@ async function evalCleanFold(page) {
     const isVisible = (el) => {
       const st = getComputedStyle(el);
       if (st.visibility === "hidden" || st.display === "none" || st.opacity === "0") return false;
-      const r = el.getBoundingClientRect();
-      return r.width > 0 && r.height > 0;
+      const r = el.getBoundingClientRect(); return r.width > 0 && r.height > 0;
     };
     const intersect = (r) => {
       const left = Math.max(0, r.left), top = Math.max(0, r.top);
@@ -174,28 +173,25 @@ async function evalCleanFold(page) {
     };
     const rgbaAlpha = (rgba) => {
       if (!rgba || !rgba.startsWith("rgba")) return 1;
-      const p = rgba.replace(/^rgba\(|\)$/g, "").split(",");
-      return parseFloat(p[3] || "1");
+      const p = rgba.replace(/^rgba\(|\)$/g, "").split(","); return parseFloat(p[3] || "1");
     };
-    const getText = (el) => (el.innerText || el.textContent || "").trim().toLowerCase();
-    const getAria = (el) => (el.getAttribute("aria-label") || el.getAttribute("title") || "").trim().toLowerCase();
-    const isMediaTag = (el) => ["IMG","VIDEO","CANVAS","SVG"].includes(el.tagName);
+    const norm = (s) => (s||"").toLowerCase().normalize("NFD").replace(/[\u0300-\u036f]/g, "");
+    const getText = (el) => (el.innerText || el.textContent || "");
+    const getAria = (el) => (el.getAttribute("aria-label") || el.getAttribute("title") || "");
+    const isMedia = (el) => ["IMG","VIDEO","CANVAS","SVG"].includes(el.tagName);
 
-    // Visible-in-fold elements
     const allInFoldVisible = Array.from(document.querySelectorAll("body *"))
       .filter((el) => isVisible(el) && inViewport(el.getBoundingClientRect()));
 
-    // Content rects (glyph-tight text + foreground media)
+    // content rects (glyph text + media + big hero BGs)
     const TEXT_LEN_MIN = 3, FONT_MIN = 12;
-    const contentRects = [];
+    const rects = [];
 
-    // Media
     for (const el of allInFoldVisible) {
-      if (!isMediaTag(el)) continue;
-      const i = intersect(el.getBoundingClientRect()); if (i) contentRects.push(i);
+      if (!isMedia(el)) continue;
+      const i = intersect(el.getBoundingClientRect()); if (i) rects.push(i);
     }
 
-    // Text nodes
     const acceptText = { acceptNode: (n) =>
       (n.nodeType === Node.TEXT_NODE && (n.textContent || "").trim().length >= TEXT_LEN_MIN)
         ? NodeFilter.FILTER_ACCEPT : NodeFilter.FILTER_SKIP };
@@ -206,24 +202,37 @@ async function evalCleanFold(page) {
       if (fsRoot < FONT_MIN || alphaRoot <= 0.05) continue;
 
       const tw = document.createTreeWalker(root, NodeFilter.SHOW_TEXT, acceptText);
-      let node; 
+      let node;
       while ((node = tw.nextNode())) {
         try {
           const rng = document.createRange(); rng.selectNodeContents(node);
-          const rects = Array.from(rng.getClientRects());
-          for (const rr of rects) {
+          const rrs = Array.from(rng.getClientRects());
+          for (const rr of rrs) {
             const i = intersect(rr); if (!i) continue;
             if (i.width < 2 || i.height < fsRoot * 0.4) continue;
-            contentRects.push(i);
+            rects.push(i);
           }
         } catch {}
       }
     }
 
-    // Grid union
+    // large non-repeating hero background as content
+    for (const el of allInFoldVisible) {
+      if (el.tagName === "HTML" || el.tagName === "BODY") continue;
+      const st = getComputedStyle(el);
+      if (st.backgroundImage && st.backgroundImage !== "none" && (st.backgroundRepeat||"").includes("no-repeat")) {
+        const i = intersect(el.getBoundingClientRect());
+        if (i) {
+          const areaPct = (i.width * i.height) / (vpW * vpH);
+          if (areaPct >= 0.25) rects.push(i);
+        }
+      }
+    }
+
+    // grid union
     const ROWS = 40, COLS = 24, cellW = vpW / COLS, cellH = vpH / ROWS;
     const cells = new Set();
-    for (const r of contentRects) {
+    for (const r of rects) {
       const x0 = Math.max(0, Math.floor(r.left / cellW));
       const x1 = Math.min(COLS - 1, Math.floor((r.right - 0.01) / cellW));
       const y0 = Math.max(0, Math.floor(r.top / cellH));
@@ -232,12 +241,24 @@ async function evalCleanFold(page) {
     }
     const foldCoveragePct = Math.min(100, Math.round((cells.size / (ROWS * COLS)) * 100));
 
-    // CTA visibility after overlay removal (authoritative for UI)
-    const CTA_RE = /(buy|add to cart|add-to-cart|shop now|sign up|sign-up|get started|get-started|try|subscribe|join|book|order|checkout|continue|download|contact)/i;
-    const actionable = Array.from(document.querySelectorAll('a,button,[role="button"],input[type="submit"],input[type="button"]'))
-      .filter((el) => isVisible(el) && !el.disabled && getComputedStyle(el).cursor !== "default");
+    // CTA (i18n) on clean view
+    const CTA_RE = new RegExp(
+      [
+        "buy","add to cart","add-to-cart","shop now","sign up","signup","get started","start now","try","free trial",
+        "subscribe","join","book","order","checkout","continue","download","contact","learn more","demo","request demo",
+        "essayer","essai gratuit","demarrer","demarrer maintenant","sinscrire","inscrivez","demander une demo","acheter",
+        "ajouter au panier","commander","souscrire",
+        "jetzt kaufen","in den warenkorb","jetzt starten","kostenlos testen","mehr erfahren","anmelden","registrieren",
+        "comprar","agregar al carrito","empieza","prueba gratis","solicitar demo","suscribete","contacto",
+        "comprar","adicionar ao carrinho","iniciar","teste gratis","solicitar demo","assine","contato",
+        "compra","aggiungi al carrello","inizia ora","prova gratis","richiedi demo","iscriviti","contattaci"
+      ].join("|"), "i"
+    );
+    const actionable = Array.from(
+      document.querySelectorAll('a,button,[role="button"],input[type="submit"],input[type="button"]')
+    ).filter((el) => isVisible(el) && !el.disabled && getComputedStyle(el).cursor !== "default");
     const firstCtaInFold = actionable.some((el) => {
-      const label = getText(el) || getAria(el) || (el.value || "").toLowerCase();
+      const label = norm(getText(el) || getAria(el) || el.value || "");
       return CTA_RE.test(label) && inViewport(el.getBoundingClientRect());
     });
 
@@ -297,193 +318,232 @@ app.post("/render", requireAuth, async (req, res) => {
 
     /* ----------------------------- In-page audit ---------------------------- */
     const tAudit0 = Date.now();
-    const ux = await page.evaluate(() => {
-      const vpW = window.innerWidth, vpH = window.innerHeight;
-      const VP = { left: 0, top: 0, right: vpW, bottom: vpH, width: vpW, height: vpH };
+const ux = await page.evaluate(() => {
+  const vpW = window.innerWidth, vpH = window.innerHeight;
 
-      const inViewport = (r) => r.top < vpH && r.bottom > 0 && r.left < vpW && r.right > 0;
-      const isVisible = (el) => {
-        const st = getComputedStyle(el);
-        if (st.visibility === "hidden" || st.display === "none" || st.opacity === "0") return false;
-        const r = el.getBoundingClientRect();
-        return r.width > 0 && r.height > 0;
-      };
-      const intersect = (r) => {
-        const left = Math.max(0, r.left), top = Math.max(0, r.top);
-        const right = Math.min(vpW, r.right), bottom = Math.min(vpH, r.bottom);
-        const w = Math.max(0, right - left), h = Math.max(0, bottom - top);
-        return w > 0 && h > 0 ? { left, top, right, bottom, width: w, height: h } : null;
-      };
-      const rgbaAlpha = (rgba) => {
-        if (!rgba || !rgba.startsWith("rgba")) return 1;
-        const p = rgba.replace(/^rgba\(|\)$/g, "").split(",");
-        return parseFloat(p[3] || "1");
-      };
-      const getText = (el) => (el.innerText || el.textContent || "").trim().toLowerCase();
-      const getAria = (el) => (el.getAttribute("aria-label") || el.getAttribute("title") || "").trim().toLowerCase();
-      const isMediaTag = (el) => ["IMG","VIDEO","CANVAS","SVG"].includes(el.tagName);
+  // ---------- utils ----------
+  const inViewport = (r) => r.top < vpH && r.bottom > 0 && r.left < vpW && r.right > 0;
+  const isVisible = (el) => {
+    const st = getComputedStyle(el);
+    if (st.visibility === "hidden" || st.display === "none" || st.opacity === "0") return false;
+    const r = el.getBoundingClientRect();
+    return r.width > 0 && r.height > 0;
+  };
+  const intersect = (r) => {
+    const left = Math.max(0, r.left), top = Math.max(0, r.top);
+    const right = Math.min(vpW, r.right), bottom = Math.min(vpH, r.bottom);
+    const w = Math.max(0, right - left), h = Math.max(0, bottom - top);
+    return w > 0 && h > 0 ? { left, top, right, bottom, width: w, height: h } : null;
+  };
+  const rgbaAlpha = (rgba) => {
+    if (!rgba || !rgba.startsWith("rgba")) return 1;
+    const p = rgba.replace(/^rgba\(|\)$/g, "").split(","); return parseFloat(p[3] || "1");
+  };
+  const norm = (s) => (s||"").toLowerCase().normalize("NFD").replace(/[\u0300-\u036f]/g, "");
+  const getText  = (el) => (el.innerText || el.textContent || "");
+  const getAria  = (el) => (el.getAttribute("aria-label") || el.getAttribute("title") || "");
+  const isMedia  = (el) => ["IMG","VIDEO","CANVAS","SVG"].includes(el.tagName);
 
-      // CTA visible in-fold?
-      const CTA_RE = /(buy|add to cart|add-to-cart|shop now|sign up|sign-up|get started|get-started|try|subscribe|join|book|order|checkout|continue|download|contact)/i;
-      const actionable = Array.from(document.querySelectorAll('a,button,[role="button"],input[type="submit"],input[type="button"]'))
-        .filter((el) => isVisible(el) && !el.disabled && getComputedStyle(el).cursor !== "default");
-      const firstCtaInFold = actionable.some((el) =>
-        CTA_RE.test(getText(el) || getAria(el) || (el.value || "")) && inViewport(el.getBoundingClientRect())
-      );
+  // ---------- CTA (i18n, accent-insensitive) ----------
+  const CTA_RE = new RegExp(
+    [
+      "buy","add to cart","add-to-cart","shop now","sign up","signup","get started","start now","try","free trial",
+      "subscribe","join","book","order","checkout","continue","download","contact","learn more","demo","request demo",
+      // fr
+      "essayer","essai gratuit","demarrer","demarrer maintenant","sinscrire","inscrivez","demander une demo","acheter",
+      "ajouter au panier","commander","souscrire",
+      // de
+      "jetzt kaufen","in den warenkorb","jetzt starten","kostenlos testen","mehr erfahren","anmelden","registrieren",
+      // es
+      "comprar","agregar al carrito","empieza","prueba gratis","solicitar demo","suscribete","contacto",
+      // pt
+      "comprar","adicionar ao carrinho","iniciar","teste gratis","solicitar demo","assine","contato",
+      // it
+      "compra","aggiungi al carrello","inizia ora","prova gratis","richiedi demo","iscriviti","contattaci"
+    ].join("|"), "i"
+  );
 
-      // All visible elements intersecting the fold
-      const allInFoldVisible = Array.from(document.querySelectorAll("body *"))
-        .filter((el) => isVisible(el) && inViewport(el.getBoundingClientRect()));
+  const actionable = Array.from(
+    document.querySelectorAll('a,button,[role="button"],input[type="submit"],input[type="button"]')
+  ).filter((el) => isVisible(el) && !el.disabled && getComputedStyle(el).cursor !== "default");
 
-      // Typography bounds in fold
-      let maxFont = 0, minFont = Infinity;
-      for (const el of allInFoldVisible) {
-        const fs = parseFloat(getComputedStyle(el).fontSize || "0");
-        if (fs > 0) { if (fs > maxFont) maxFont = fs; if (fs < minFont) minFont = fs; }
-      }
+  const firstCtaInFold = actionable.some((el) => {
+    const label = norm(getText(el) || getAria(el) || el.value || "");
+    return CTA_RE.test(label) && inViewport(el.getBoundingClientRect());
+  });
 
-      // Small tap targets in fold
-      const smallTapTargets = actionable.filter((el) => {
-        const r = el.getBoundingClientRect();
-        return inViewport(r) && (r.width < 44 || r.height < 44);
-      }).length;
+  // ---------- visible elements in fold ----------
+  const allInFoldVisible = Array.from(document.querySelectorAll("body *"))
+    .filter((el) => isVisible(el) && inViewport(el.getBoundingClientRect()));
 
-      // Viewport meta
-      const hasViewportMeta = !!document.querySelector('meta[name="viewport"]');
+  // Typography bounds
+  let maxFontPx = 0, minFontPx = Infinity;
+  for (const el of allInFoldVisible) {
+    const fs = parseFloat(getComputedStyle(el).fontSize || "0");
+    if (fs > 0) { if (fs > maxFontPx) maxFontPx = fs; if (fs < minFontPx) minFontPx = fs; }
+  }
+  if (!Number.isFinite(minFontPx)) minFontPx = 0;
 
-      // Safe-area CSS (approx)
-      let usesSafeAreaCSS = false;
-      for (const ss of Array.from(document.styleSheets)) {
-        try {
-          for (const rule of Array.from(ss.cssRules)) {
-            if (rule.cssText && rule.cssText.includes("safe-area-inset")) { usesSafeAreaCSS = true; break; }
-          }
-          if (usesSafeAreaCSS) break;
-        } catch {}
-      }
+  // Small tap targets (basic; you can add chat-bubble ignore later)
+  const smallTapTargets = actionable.filter((el) => {
+    const r = el.getBoundingClientRect();
+    return inViewport(r) && (r.width < 44 || r.height < 44);
+  }).length;
 
-      /* ------------------------- Overlay detection ------------------------- */
-      const overlayCandidates = Array.from(document.querySelectorAll("body *")).filter((el) => {
-        if (!isVisible(el)) return false;
-        const st = getComputedStyle(el);
-        if (!["fixed","sticky"].includes(st.position)) return false;
-        const r = el.getBoundingClientRect(); if (!inViewport(r)) return false;
-        const inter = intersect(r); if (!inter) return false;
-        const areaPct = (inter.width * inter.height) / (vpW * vpH);
-        const z = parseInt(st.zIndex || "0", 10) || 0;
-        if (areaPct >= 0.15 && z >= 100) return true; // sizable overlay
-        const hint = (el.id + " " + el.className + " " + (el.getAttribute("role") || "") + " " + (el.getAttribute("aria-label") || "")).toLowerCase();
-        return /(cookie|consent|gdpr|privacy|cmp)/.test(hint);
-      });
+  const hasViewportMeta = !!document.querySelector('meta[name="viewport"]');
 
-      // Mark overlays so Node can hide them before screenshot
-      overlayCandidates.forEach((el) => el.setAttribute("data-foldy-overlay", "1"));
+  // ---------- overlay detection (stricter; avoids headers) ----------
+  const isLikelyHeader = (el, r, st) => {
+    if (el.closest("header,[role='banner'],nav,[role='navigation']")) return true;
+    const nearTop = r.top <= 0 && r.height <= vpH * 0.35;
+    const fullWidth = r.width >= vpW * 0.9;
+    const cookieHint = /(cookie|consent|gdpr|privacy|cmp)/i.test(
+      (el.id + " " + el.className + " " + (el.getAttribute("role")||"") + " " + (el.getAttribute("aria-label")||""))
+    );
+    return nearTop && fullWidth && !cookieHint;
+  };
 
-      const overlayRects = overlayCandidates
-        .map((el) => intersect(el.getBoundingClientRect()))
-        .filter(Boolean);
+  const overlayCandidates = Array.from(document.querySelectorAll("body *")).filter((el) => {
+    if (!isVisible(el)) return false;
+    const st = getComputedStyle(el);
+    if (!["fixed","sticky"].includes(st.position)) return false;
+    const r = el.getBoundingClientRect(); if (!inViewport(r)) return false;
+    if (isLikelyHeader(el, r, st)) return false;
 
-      // "Blockers" = very large/top-covering overlays
-      const overlayBlockers = overlayCandidates.filter((el) => {
-        const r = el.getBoundingClientRect();
-        const inter = intersect(r);
-        const areaPct = inter ? (inter.width * inter.height) / (vpW * vpH) : 0;
-        const topCover = r.top <= 0 && r.height >= vpH * 0.25;
-        return areaPct >= 0.30 || topCover;
-      }).length;
+    const inter = intersect(r); if (!inter) return false;
+    const areaPct = (inter.width * inter.height) / (vpW * vpH);
+    const z = parseInt(st.zIndex || "0", 10) || 0;
 
-      /* ------------------ Content rects (glyph-tight) ------------------ */
-      const TEXT_LEN_MIN = 3, FONT_MIN = 12;
-      const contentRects = [];
+    const cookieHint = /(cookie|consent|gdpr|privacy|cmp)/i.test(
+      (el.id + " " + el.className + " " + (el.getAttribute("role")||"") + " " + (el.getAttribute("aria-label")||""))
+    );
+    const isDialog = el.getAttribute("role") === "dialog" || el.getAttribute("aria-modal") === "true";
 
-      // Foreground media
-      for (const el of allInFoldVisible) {
-        if (!isMediaTag(el)) continue;
-        const i = intersect(el.getBoundingClientRect()); if (i) contentRects.push(i);
-      }
+    const wideBar = inter.width >= vpW * 0.9 && r.height >= 64;
+    const nearBottom = r.bottom >= vpH - Math.min(200, vpH * 0.3);
+    const hasConsentButtons =
+      /(accept|allow|agree|deny|reject|save|preferences|settings)/i.test((el.innerText||"")) &&
+      el.querySelectorAll("button,a,[role='button']").length >= 2;
 
-      // Text nodes
-      const acceptText = { acceptNode: (n) =>
-        (n.nodeType === Node.TEXT_NODE && (n.textContent || "").trim().length >= TEXT_LEN_MIN)
-          ? NodeFilter.FILTER_ACCEPT : NodeFilter.FILTER_SKIP };
-      for (const root of allInFoldVisible) {
-        const stRoot = getComputedStyle(root);
-        const fsRoot = parseFloat(stRoot.fontSize || "0");
-        const alphaRoot = rgbaAlpha(stRoot.color || "rgba(0,0,0,1)");
-        if (fsRoot < FONT_MIN || alphaRoot <= 0.05) continue;
+    if (cookieHint || isDialog) return true;
+    if (nearBottom && wideBar && hasConsentButtons) return true;
+    if (areaPct >= 0.30 && z >= 300) return true;   // huge cover
+    if (areaPct >= 0.15 && z >= 500) return true;   // sizable, very high z
 
-        const tw = document.createTreeWalker(root, NodeFilter.SHOW_TEXT, acceptText);
-        let node;
-        while ((node = tw.nextNode())) {
-          try {
-            const rng = document.createRange(); rng.selectNodeContents(node);
-            const rects = Array.from(rng.getClientRects());
-            for (const rr of rects) {
-              const i = intersect(rr); if (!i) continue;
-              if (i.width < 2 || i.height < fsRoot * 0.4) continue; // filter slivers
-              contentRects.push(i);
-            }
-          } catch {}
+    return false;
+  });
+
+  overlayCandidates.forEach((el) => el.setAttribute("data-foldy-overlay", "1"));
+  const overlayRects = overlayCandidates.map((el) => intersect(el.getBoundingClientRect())).filter(Boolean);
+  const overlayBlockers = overlayCandidates.filter((el) => {
+    const r = el.getBoundingClientRect();
+    const i = intersect(r);
+    const areaPct = i ? (i.width * i.height) / (vpW * vpH) : 0;
+    const topCover = r.top <= 0 && r.height >= vpH * 0.25;
+    return areaPct >= 0.30 || topCover;
+  }).length;
+
+  // ---------- content rects (glyph-tight text + media + big hero BGs) ----------
+  const TEXT_LEN_MIN = 3, FONT_MIN = 12;
+  const contentRects = [];
+
+  // media elements
+  for (const el of allInFoldVisible) {
+    if (!isMedia(el)) continue;
+    const i = intersect(el.getBoundingClientRect()); if (i) contentRects.push(i);
+  }
+
+  // glyph-tight text nodes
+  const acceptText = { acceptNode: (n) =>
+    (n.nodeType === Node.TEXT_NODE && (n.textContent || "").trim().length >= TEXT_LEN_MIN)
+      ? NodeFilter.FILTER_ACCEPT : NodeFilter.FILTER_SKIP };
+  for (const root of allInFoldVisible) {
+    const stRoot = getComputedStyle(root);
+    const fsRoot = parseFloat(stRoot.fontSize || "0");
+    const alphaRoot = rgbaAlpha(stRoot.color || "rgba(0,0,0,1)");
+    if (fsRoot < FONT_MIN || alphaRoot <= 0.05) continue;
+
+    const tw = document.createTreeWalker(root, NodeFilter.SHOW_TEXT, acceptText);
+    let node; 
+    while ((node = tw.nextNode())) {
+      try {
+        const rng = document.createRange(); rng.selectNodeContents(node);
+        const rects = Array.from(rng.getClientRects());
+        for (const rr of rects) {
+          const i = intersect(rr); if (!i) continue;
+          if (i.width < 2 || i.height < fsRoot * 0.4) continue;
+          contentRects.push(i);
         }
+      } catch {}
+    }
+  }
+
+  // large non-repeating hero background → treat as content (conversion-relevant)
+  for (const el of allInFoldVisible) {
+    if (el.tagName === "HTML" || el.tagName === "BODY") continue;
+    const st = getComputedStyle(el);
+    if (st.backgroundImage && st.backgroundImage !== "none" && (st.backgroundRepeat||"").includes("no-repeat")) {
+      const i = intersect(el.getBoundingClientRect());
+      if (i) {
+        const areaPct = (i.width * i.height) / (vpW * vpH);
+        if (areaPct >= 0.25 && !el.closest('[data-foldy-overlay="1"]')) contentRects.push(i);
       }
+    }
+  }
 
-      // Painted rects (debug/insight)
-      const paintedRects = [...contentRects];
-      for (const el of allInFoldVisible) {
-        if (isMediaTag(el)) continue;
-        const st = getComputedStyle(el);
-        let paints = false;
-        if (st.backgroundImage && st.backgroundImage !== "none") paints = true;
-        const bg = st.backgroundColor || "";
-        if (!paints && bg && bg !== "transparent") paints = !bg.startsWith("rgba") || rgbaAlpha(bg) > 0.05;
-        if (!paints) {
-          const hasBorder =
-            ["borderTopWidth","borderRightWidth","borderBottomWidth","borderLeftWidth"].some(k => parseFloat(st[k]) > 0) &&
-            ["borderTopColor","borderRightColor","borderBottomColor","borderLeftColor"].some(k => (st[k]||"") !== "transparent");
-          paints = hasBorder;
-        }
-        if (paints) { const i = intersect(el.getBoundingClientRect()); if (i) paintedRects.push(i); }
-      }
+  // painted (debug)
+  const paintedRects = [...contentRects];
+  for (const el of allInFoldVisible) {
+    if (isMedia(el)) continue;
+    const st = getComputedStyle(el);
+    let paints = false;
+    if (st.backgroundImage && st.backgroundImage !== "none") paints = true;
+    const bg = st.backgroundColor || "";
+    if (!paints && bg && bg !== "transparent") paints = !bg.startsWith("rgba") || rgbaAlpha(bg) > 0.05;
+    if (!paints) {
+      const hasBorder =
+        ["borderTopWidth","borderRightWidth","borderBottomWidth","borderLeftWidth"].some(k => parseFloat(st[k]) > 0) &&
+        ["borderTopColor","borderRightColor","borderBottomColor","borderLeftColor"].some(k => (st[k]||"") !== "transparent");
+      paints = hasBorder;
+    }
+    if (paints) { const i = intersect(el.getBoundingClientRect()); if (i) paintedRects.push(i); }
+  }
 
-      // Grid union helpers
-      const ROWS = 40, COLS = 24, cellW = vpW / COLS, cellH = vpH / ROWS;
-      const toCells = (rects) => {
-        const set = new Set();
-        for (const r of rects) {
-          const x0 = Math.max(0, Math.floor(r.left / cellW));
-          const x1 = Math.min(COLS - 1, Math.floor((r.right - 0.01) / cellW));
-          const y0 = Math.max(0, Math.floor(r.top / cellH));
-          const y1 = Math.min(ROWS - 1, Math.floor((r.bottom - 0.01) / cellH));
-          for (let y = y0; y <= y1; y++) for (let x = x0; x <= x1; x++) set.add(y * COLS + x);
-        }
-        return set;
-      };
-      const pct = (set) => Math.min(100, Math.round((set.size / (ROWS * COLS)) * 100));
+  // grid union helpers
+  const ROWS = 40, COLS = 24, cellW = vpW / COLS, cellH = vpH / ROWS;
+  const toCells = (rects) => {
+    const set = new Set();
+    for (const r of rects) {
+      const x0 = Math.max(0, Math.floor(r.left / cellW));
+      const x1 = Math.min(COLS - 1, Math.floor((r.right - 0.01) / cellW));
+      const y0 = Math.max(0, Math.floor(r.top / cellH));
+      const y1 = Math.min(ROWS - 1, Math.floor((r.bottom - 0.01) / cellH));
+      for (let y = y0; y <= y1; y++) for (let x = x0; x <= x1; x++) set.add(y * COLS + x);
+    }
+    return set;
+  };
+  const pct = (set) => Math.min(100, Math.round((set.size / (ROWS * COLS)) * 100));
 
-      const contentCells = toCells(contentRects);
-      const paintedCells = toCells(paintedRects);
-      const overlayCells = toCells(overlayRects);
+  const contentCells = toCells(contentRects);
+  const paintedCells = toCells(paintedRects);
+  const overlayCells = toCells(overlayRects);
 
-      const visibleFoldCoveragePct = pct(contentCells);           // includes overlay
-      const overlayCoveragePct = pct(overlayCells);
-      const underlayCells = new Set([...contentCells].filter((id) => !overlayCells.has(id)));
-      const foldCoveragePct = pct(underlayCells);                  // EXCLUDES overlay (use for score)
+  const visibleFoldCoveragePct = pct(contentCells);
+  const overlayCoveragePct = pct(overlayCells);
 
-      return {
-        firstCtaInFold,
-        foldCoveragePct,                // clean / baseline
-        visibleFoldCoveragePct,         // as-seen
-        paintedCoveragePct: pct(paintedCells),
-        overlayCoveragePct,
-        overlayBlockers,
-        overlayElemsMarked: overlayCandidates.length,
-        maxFontPx: maxFont || 0,
-        minFontPx: Number.isFinite(minFont) ? minFont : 0,
-        smallTapTargets,
-        hasViewportMeta,
-        usesSafeAreaCSS
-      };
-    });
+  // PRE-HIDE fold (we’ll recompute clean later)
+  return {
+    firstCtaInFold,
+    visibleFoldCoveragePct,
+    paintedCoveragePct: pct(paintedCells),
+    overlayCoveragePct,
+    overlayBlockers,
+    overlayElemsMarked: overlayCandidates.length,
+    maxFontPx, minFontPx, smallTapTargets, hasViewportMeta,
+    usesSafeAreaCSS: false
+  };
+});
+
     const audit_ms = Date.now() - tAudit0;
 
     /* ------------------- Screenshots (clean-only by default) ------------------- */
