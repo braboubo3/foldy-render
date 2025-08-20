@@ -199,6 +199,7 @@ app.post("/render", requireAuth, async (req, res) => {
     // --- DOM audit (runs in-page)
     const tAudit0 = Date.now();
 // Replace your current evaluate(...) with THIS:
+// Replace your current evaluate(...) with THIS:
 const ux = await page.evaluate(() => {
   /**
    * Foldy in-page audit (runs inside the browser)
