@@ -198,24 +198,16 @@ app.post("/render", requireAuth, async (req, res) => {
 
     // --- DOM audit (runs in-page)
     const tAudit0 = Date.now();
+
+    
 // Replace your current evaluate(...) with THIS:
 const ux = await page.evaluate(() => {
-  /**
-   * Foldy in-page audit
-   * - CTA visibility, typography bounds, tap targets, overlays, viewport meta, safe-area usage
-   * - Coverage via point sampling:
-   *     foldCoveragePct      → % of viewport cells where the topmost content is text (>=12px, some length)
-   *                             or foreground media (IMG/VIDEO/SVG/CANVAS). Ignores BGs/wrappers.
-   *     paintedCoveragePct   → visual coverage incl. background color/images/borders (debugging only)
-   */
-
-  // ---------------- Viewport ----------------
+  // ======== Viewport ========
   const vpW = window.innerWidth;
   const vpH = window.innerHeight;
 
-  // --------------- Helpers ------------------
+  // ======== Helpers ========
   const inViewport = (r) => r.top < vpH && r.bottom > 0 && r.left < vpW && r.right > 0;
-
   const isVisible = (el) => {
     const st = getComputedStyle(el);
     if (st.visibility === "hidden" || st.display === "none" || st.opacity === "0") return false;
@@ -223,11 +215,10 @@ const ux = await page.evaluate(() => {
     const r = el.getBoundingClientRect();
     return r.width > 0 && r.height > 0;
   };
-
   const getText = (el) => (el.innerText || el.textContent || "").trim().toLowerCase();
   const getAria = (el) => (el.getAttribute("aria-label") || el.getAttribute("title") || "").trim().toLowerCase();
 
-  // --------------- CTA detection ------------
+  // ======== CTA detection ========
   const CTA_RE = /(buy|add to cart|add-to-cart|shop now|sign up|sign-up|get started|get-started|try|subscribe|join|book|order|checkout|continue|download|contact)/i;
   const actionCandidates = Array.from(
     document.querySelectorAll('a,button,[role="button"],input[type="submit"],input[type="button"]')
@@ -236,36 +227,31 @@ const ux = await page.evaluate(() => {
   const firstCtaInFold = actionCandidates.some((el) => {
     const label = getText(el) || getAria(el) || (el.value || "").toLowerCase();
     if (!CTA_RE.test(label)) return false;
-    const r = el.getBoundingClientRect();
-    return inViewport(r);
+    return inViewport(el.getBoundingClientRect());
   });
 
-  // --------------- Visible elements (for fonts/taps) ---------------
+  // ======== Visible elements in the fold (for fonts/taps) ========
   const allInFoldVisible = Array.from(document.querySelectorAll("body *")).filter(
     (el) => isVisible(el) && inViewport(el.getBoundingClientRect())
   );
 
-  // Typography bounds in the fold
-  let maxFont = 0;
-  let minFont = Infinity;
+  // Typography bounds
+  let maxFont = 0, minFont = Infinity;
   for (const el of allInFoldVisible) {
     const fs = parseFloat(getComputedStyle(el).fontSize || "0");
-    if (fs > 0) {
-      if (fs > maxFont) maxFont = fs;
-      if (fs < minFont) minFont = fs;
-    }
+    if (fs > 0) { if (fs > maxFont) maxFont = fs; if (fs < minFont) minFont = fs; }
   }
 
-  // Small tap targets (<44x44) among actionable elements in the fold
+  // Small tap targets
   const smallTapTargets = actionCandidates.filter((el) => {
     const r = el.getBoundingClientRect();
     return inViewport(r) && (r.width < 44 || r.height < 44);
   }).length;
 
-  // Viewport meta present?
+  // Viewport meta
   const hasViewportMeta = !!document.querySelector('meta[name="viewport"]');
 
-  // Overlays: large fixed/sticky with high z-index covering ≥30% of the fold
+  // Overlays (large fixed/sticky)
   const overlayBlockers = Array.from(document.querySelectorAll("body *")).filter((el) => {
     const st = getComputedStyle(el);
     if (!["fixed", "sticky"].includes(st.position)) return false;
@@ -275,11 +261,10 @@ const ux = await page.evaluate(() => {
     if (!inViewport(r)) return false;
     const w = Math.max(0, Math.min(r.right, vpW) - Math.max(r.left, 0));
     const h = Math.max(0, Math.min(r.bottom, vpH) - Math.max(r.top, 0));
-    const area = w * h;
-    return r.top <= 0 && area >= vpW * vpH * 0.3;
+    return r.top <= 0 && w * h >= vpW * vpH * 0.3;
   }).length;
 
-  // Safe-area CSS usage (approx; ignore cross-origin errors)
+  // Safe-area usage
   let usesSafeAreaCSS = false;
   for (const ss of Array.from(document.styleSheets)) {
     try {
@@ -287,17 +272,13 @@ const ux = await page.evaluate(() => {
         if (rule.cssText && rule.cssText.includes("safe-area-inset")) { usesSafeAreaCSS = true; break; }
       }
       if (usesSafeAreaCSS) break;
-    } catch { /* cross-origin */ }
+    } catch {}
   }
 
-  // ---------------- Coverage via point sampling ----------------
-  // Grid over the viewport; test center of each cell.
-  const ROWS = 36;      // adjust for speed/accuracy
-  const COLS = 20;
-  const cellW = vpW / COLS;
-  const cellH = vpH / ROWS;
+  // ======== Coverage via point sampling (glyph-aware) ========
+  const ROWS = 36, COLS = 20;         // tweak for accuracy/speed
+  const cellW = vpW / COLS, cellH = vpH / ROWS;
 
-  // Helpers to classify the *topmost* thing at a point
   const isMediaTag = (el) => {
     const t = el.tagName;
     return t === "IMG" || t === "VIDEO" || t === "CANVAS" || t === "SVG";
@@ -305,19 +286,45 @@ const ux = await page.evaluate(() => {
 
   const rgbaAlpha = (rgba) => {
     if (!rgba || !rgba.startsWith("rgba")) return 1;
-    const parts = rgba.replace(/^rgba\(|\)$/g, "").split(",");
-    return parseFloat(parts[3] || "1");
+    const p = rgba.replace(/^rgba\(|\)$/g, "").split(",");
+    return parseFloat(p[3] || "1");
   };
 
-  const pointHasText = (x, y) => {
-    const cp = (document.caretPositionFromPoint && document.caretPositionFromPoint(x, y)) ||
-               (document.caretRangeFromPoint && document.caretRangeFromPoint(x, y));
-    if (!cp) return false;
-    const node = cp.offsetNode || cp.startContainer;
+  // Find a visible glyph at (x,y), not just a text node
+  const pointHasGlyph = (x, y) => {
+    const caretPos = (document.caretPositionFromPoint && document.caretPositionFromPoint(x, y)) ||
+                     (document.caretRangeFromPoint && document.caretRangeFromPoint(x, y));
+    if (!caretPos) return false;
+
+    const node = caretPos.offsetNode || caretPos.startContainer;
     if (!node || node.nodeType !== Node.TEXT_NODE) return false;
-    const text = (node.textContent || "").trim();
-    if (text.length < 3) return false;
-    // approximate font size/color at that point using the element under it
+
+    const text = node.textContent || "";
+    if (!text.trim()) return false;
+
+    // pick nearest non-whitespace character around the offset
+    const base = caretPos.offset || caretPos.startOffset || 0;
+    const isNonWs = (ch) => !!ch && !/\s/.test(ch);
+    let idx = -1;
+    for (let d = 0; d <= 3; d++) {                // search ±3 chars
+      if (isNonWs(text[base + d])) { idx = base + d; break; }
+      if (isNonWs(text[base - d])) { idx = base - d; break; }
+    }
+    if (idx < 0) return false;
+
+    const range = document.createRange();
+    try {
+      range.setStart(node, Math.max(0, idx));
+      range.setEnd(node, Math.min(text.length, idx + 1));
+    } catch { return false; }
+
+    const rect = range.getBoundingClientRect();
+    if (!rect || rect.width === 0 || rect.height === 0) return false;
+
+    // ensure the point lies inside the actual glyph rect
+    if (x < rect.left || x > rect.right || y < rect.top || y > rect.bottom) return false;
+
+    // font visibility threshold
     const el = document.elementFromPoint(x, y);
     if (!el) return false;
     const st = getComputedStyle(el);
@@ -329,20 +336,18 @@ const ux = await page.evaluate(() => {
   const pointPaintsVisually = (x, y) => {
     const el = document.elementFromPoint(x, y);
     if (!el) return false;
-    const st = getComputedStyle(el);
+    if (!isVisible(el)) return false;
 
-    // media or text counts as painted anyway
     if (isMediaTag(el)) return true;
-    if (pointHasText(x, y)) return true;
+    if (pointHasGlyph(x, y)) return true;
 
-    // otherwise consider backgrounds/borders as "painted" (for debug metric)
+    const st = getComputedStyle(el);
     if (st.backgroundImage && st.backgroundImage !== "none") return true;
 
     const bg = st.backgroundColor || "";
     if (bg && bg !== "transparent") {
       if (!bg.startsWith("rgba")) return true;
-      const a = rgbaAlpha(bg);
-      if (a > 0.05) return true;
+      if (rgbaAlpha(bg) > 0.05) return true;
     }
     const hasBorder =
       ["borderTopWidth","borderRightWidth","borderBottomWidth","borderLeftWidth"].some(k => parseFloat(st[k]) > 0) &&
@@ -350,9 +355,7 @@ const ux = await page.evaluate(() => {
     return hasBorder;
   };
 
-  let contentHits = 0;
-  let paintedHits = 0;
-
+  let contentHits = 0, paintedHits = 0;
   for (let r = 0; r < ROWS; r++) {
     for (let c = 0; c < COLS; c++) {
       const x = (c + 0.5) * cellW;
@@ -362,9 +365,8 @@ const ux = await page.evaluate(() => {
       const el = document.elementFromPoint(x, y);
       if (!el || !isVisible(el)) continue;
 
-      const isContent =
-        isMediaTag(el) || pointHasText(x, y);          // foreground content only
-      const isPainted = pointPaintsVisually(x, y);     // includes BGs/borders
+      const isContent = isMediaTag(el) || pointHasGlyph(x, y);  // foreground only
+      const isPainted = pointPaintsVisually(x, y);               // includes backgrounds
 
       if (isContent) contentHits++;
       if (isPainted) paintedHits++;
@@ -372,17 +374,13 @@ const ux = await page.evaluate(() => {
   }
 
   const totalCells = ROWS * COLS;
-  const contentCoveragePct  = Math.round((contentHits  / totalCells) * 100);
-  const paintedCoveragePct  = Math.round((paintedHits  / totalCells) * 100);
+  const foldCoveragePct     = Math.min(100, Math.round((contentHits / totalCells) * 100));
+  const paintedCoveragePct  = Math.min(100, Math.round((paintedHits / totalCells) * 100));
 
-  // Expose "foldCoveragePct" as the content metric for scoring
-  const foldCoveragePct = Math.min(100, Math.max(0, contentCoveragePct));
-
-  // ---------------- Return payload ----------------
   return {
     firstCtaInFold,
-    foldCoveragePct,          // content-only (use this for scoring)
-    paintedCoveragePct,       // visual incl. backgrounds (debug)
+    foldCoveragePct,         // content-only (use for scoring)
+    paintedCoveragePct,      // including backgrounds (debug)
     maxFontPx: maxFont || 0,
     minFontPx: Number.isFinite(minFont) ? minFont : 0,
     smallTapTargets,
@@ -391,6 +389,7 @@ const ux = await page.evaluate(() => {
     usesSafeAreaCSS
   };
 });
+
 
 
 
