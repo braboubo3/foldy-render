@@ -156,6 +156,96 @@ async function hideOverlaysAndUnlock(page) {
   });
 }
 
+async function evalCleanFold(page) {
+  return page.evaluate(() => {
+    const vpW = window.innerWidth, vpH = window.innerHeight;
+    const inViewport = (r) => r.top < vpH && r.bottom > 0 && r.left < vpW && r.right > 0;
+    const isVisible = (el) => {
+      const st = getComputedStyle(el);
+      if (st.visibility === "hidden" || st.display === "none" || st.opacity === "0") return false;
+      const r = el.getBoundingClientRect();
+      return r.width > 0 && r.height > 0;
+    };
+    const intersect = (r) => {
+      const left = Math.max(0, r.left), top = Math.max(0, r.top);
+      const right = Math.min(vpW, r.right), bottom = Math.min(vpH, r.bottom);
+      const w = Math.max(0, right - left), h = Math.max(0, bottom - top);
+      return w > 0 && h > 0 ? { left, top, right, bottom, width: w, height: h } : null;
+    };
+    const rgbaAlpha = (rgba) => {
+      if (!rgba || !rgba.startsWith("rgba")) return 1;
+      const p = rgba.replace(/^rgba\(|\)$/g, "").split(",");
+      return parseFloat(p[3] || "1");
+    };
+    const getText = (el) => (el.innerText || el.textContent || "").trim().toLowerCase();
+    const getAria = (el) => (el.getAttribute("aria-label") || el.getAttribute("title") || "").trim().toLowerCase();
+    const isMediaTag = (el) => ["IMG","VIDEO","CANVAS","SVG"].includes(el.tagName);
+
+    // Visible-in-fold elements
+    const allInFoldVisible = Array.from(document.querySelectorAll("body *"))
+      .filter((el) => isVisible(el) && inViewport(el.getBoundingClientRect()));
+
+    // Content rects (glyph-tight text + foreground media)
+    const TEXT_LEN_MIN = 3, FONT_MIN = 12;
+    const contentRects = [];
+
+    // Media
+    for (const el of allInFoldVisible) {
+      if (!isMediaTag(el)) continue;
+      const i = intersect(el.getBoundingClientRect()); if (i) contentRects.push(i);
+    }
+
+    // Text nodes
+    const acceptText = { acceptNode: (n) =>
+      (n.nodeType === Node.TEXT_NODE && (n.textContent || "").trim().length >= TEXT_LEN_MIN)
+        ? NodeFilter.FILTER_ACCEPT : NodeFilter.FILTER_SKIP };
+    for (const root of allInFoldVisible) {
+      const stRoot = getComputedStyle(root);
+      const fsRoot = parseFloat(stRoot.fontSize || "0");
+      const alphaRoot = rgbaAlpha(stRoot.color || "rgba(0,0,0,1)");
+      if (fsRoot < FONT_MIN || alphaRoot <= 0.05) continue;
+
+      const tw = document.createTreeWalker(root, NodeFilter.SHOW_TEXT, acceptText);
+      let node; 
+      while ((node = tw.nextNode())) {
+        try {
+          const rng = document.createRange(); rng.selectNodeContents(node);
+          const rects = Array.from(rng.getClientRects());
+          for (const rr of rects) {
+            const i = intersect(rr); if (!i) continue;
+            if (i.width < 2 || i.height < fsRoot * 0.4) continue;
+            contentRects.push(i);
+          }
+        } catch {}
+      }
+    }
+
+    // Grid union
+    const ROWS = 40, COLS = 24, cellW = vpW / COLS, cellH = vpH / ROWS;
+    const cells = new Set();
+    for (const r of contentRects) {
+      const x0 = Math.max(0, Math.floor(r.left / cellW));
+      const x1 = Math.min(COLS - 1, Math.floor((r.right - 0.01) / cellW));
+      const y0 = Math.max(0, Math.floor(r.top / cellH));
+      const y1 = Math.min(ROWS - 1, Math.floor((r.bottom - 0.01) / cellH));
+      for (let y = y0; y <= y1; y++) for (let x = x0; x <= x1; x++) cells.add(y * COLS + x);
+    }
+    const foldCoveragePct = Math.min(100, Math.round((cells.size / (ROWS * COLS)) * 100));
+
+    // CTA visibility after overlay removal (authoritative for UI)
+    const CTA_RE = /(buy|add to cart|add-to-cart|shop now|sign up|sign-up|get started|get-started|try|subscribe|join|book|order|checkout|continue|download|contact)/i;
+    const actionable = Array.from(document.querySelectorAll('a,button,[role="button"],input[type="submit"],input[type="button"]'))
+      .filter((el) => isVisible(el) && !el.disabled && getComputedStyle(el).cursor !== "default");
+    const firstCtaInFold = actionable.some((el) => {
+      const label = getText(el) || getAria(el) || (el.value || "").toLowerCase();
+      return CTA_RE.test(label) && inViewport(el.getBoundingClientRect());
+    });
+
+    return { foldCoveragePct, firstCtaInFold };
+  });
+}
+
+
 /* --------------------------------- /render --------------------------------
  * Body: { url: string, device: keyof DEVICE_MAP, debugOverlay?: boolean }
  * Returns: clean screenshot (overlay removed) + fold audit (overlay-excluded).
@@ -416,6 +506,16 @@ app.post("/render", requireAuth, async (req, res) => {
     await page.waitForTimeout(120);
     const hide_ms = Date.now() - tHide0;
 
+    // Recompute fold on the CLEAN view so metrics match the screenshot
+    const tClean0 = Date.now();
+    const clean = await evalCleanFold(page);
+    const clean_ms = Date.now() - tClean0;
+    
+    // Overwrite the fields we display/score
+    ux.foldCoveragePct = clean.foldCoveragePct;
+    ux.firstCtaInFold  = clean.firstCtaInFold;
+
+
     const tShot0 = Date.now();
     const buf = await page.screenshot({
       type: "png",
@@ -444,6 +544,7 @@ app.post("/render", requireAuth, async (req, res) => {
         settle_ms,
         audit_ms,
         hide_ms,
+        clean_ms, 
         screenshot_ms,
         total_ms: Date.now() - start,
       },
