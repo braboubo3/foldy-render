@@ -1,5 +1,5 @@
 /**
- * foldy-render — Replit microservice
+ * foldy-render — Microservice
  * One request per device → headless Chromium → returns:
  *  - first-viewport screenshot (base64 PNG)
  *  - fold-focused DOM audit (CTA-in-fold, font sizes, tap targets, overlays, viewport meta, safe-area)
@@ -198,86 +198,174 @@ app.post("/render", requireAuth, async (req, res) => {
 
     // --- DOM audit (runs in-page)
     const tAudit0 = Date.now();
+// Replace your current evaluate(...) with THIS:
 const ux = await page.evaluate(() => {
-// Helpers
-const inViewport = (r) => r.top < vpH && r.bottom > 0 && r.left < vpW && r.right > 0;
-const isVisible = (el) => {
-  const st = getComputedStyle(el);
-  if (st.visibility === "hidden" || st.display === "none" || st.opacity === "0") return false;
-  const r = el.getBoundingClientRect();
-  return r.width > 0 && r.height > 0;
-};
+  /**
+   * Foldy in-page audit (runs inside the browser)
+   * - Computes CTA visibility, typography bounds, tap targets, overlays, viewport meta, safe-area usage
+   * - Computes "painted" fold coverage via a coarse grid union (no double-count)
+   */
 
-// Heuristic: element "paints" something meaningful?
-const PAINT_ALPHA_MIN = 0.05;
-const hasPaint = (el) => {
-  const st = getComputedStyle(el);
-  // Visible text
-  const text = (el.innerText || el.textContent || "").trim();
-  const fs = parseFloat(st.fontSize || "0");
-  const color = st.color || "rgba(0,0,0,1)";
-  const alpha = color.startsWith("rgba") ? parseFloat(color.split(",").pop()) : 1;
-  const paintsText = text.length > 0 && fs > 0 && alpha > PAINT_ALPHA_MIN;
+  // ---- Viewport metrics
+  const vpW = window.innerWidth;
+  const vpH = window.innerHeight;
 
-  // Media / vector
-  const isMedia = el.tagName === "IMG" || el.tagName === "VIDEO" || el.tagName === "CANVAS" || el.tagName === "SVG";
+  // ---- Helpers
+  const inViewport = (r) => r.top < vpH && r.bottom > 0 && r.left < vpW && r.right > 0;
 
-  // Backgrounds / borders
-  const bgHasImage = st.backgroundImage && st.backgroundImage !== "none";
-  const bgHasColor = (() => {
-    // crude alpha check for background-color
-    const bg = st.backgroundColor || "";
-    if (!bg || bg === "transparent") return false;
-    if (bg.startsWith("rgba")) {
-      const a = parseFloat(bg.split(",").pop());
-      return a > PAINT_ALPHA_MIN;
+  const isVisible = (el) => {
+    const st = getComputedStyle(el);
+    if (st.visibility === "hidden" || st.display === "none" || st.opacity === "0") return false;
+    if (st.pointerEvents === "none") return false;
+    const r = el.getBoundingClientRect();
+    return r.width > 0 && r.height > 0;
+  };
+
+  const getText = (el) => (el.innerText || el.textContent || "").trim().toLowerCase();
+  const getAria = (el) => (el.getAttribute("aria-label") || el.getAttribute("title") || "").trim().toLowerCase();
+
+  // ---- CTA detection
+  const CTA_RE = /(buy|add to cart|add-to-cart|shop now|sign up|sign-up|get started|get-started|try|subscribe|join|book|order|checkout|continue|download|contact)/i;
+  const actionCandidates = Array.from(
+    document.querySelectorAll('a,button,[role="button"],input[type="submit"],input[type="button"]')
+  ).filter((el) => isVisible(el) && !el.disabled && getComputedStyle(el).cursor !== "default");
+
+  const firstCtaInFold = actionCandidates.some((el) => {
+    const label = getText(el) || getAria(el) || (el.value || "").toLowerCase();
+    if (!CTA_RE.test(label)) return false;
+    const r = el.getBoundingClientRect();
+    return inViewport(r);
+  });
+
+  // ---- Collect visible elements intersecting the fold
+  const allInFoldVisible = Array.from(document.querySelectorAll("body *")).filter((el) => {
+    if (!isVisible(el)) return false;
+    const r = el.getBoundingClientRect();
+    return inViewport(r);
+  });
+
+  // ---- Typography bounds (within fold)
+  let maxFont = 0;
+  let minFont = Infinity;
+  for (const el of allInFoldVisible) {
+    const fs = parseFloat(getComputedStyle(el).fontSize || "0");
+    if (fs > 0) {
+      if (fs > maxFont) maxFont = fs;
+      if (fs < minFont) minFont = fs;
     }
-    return true; // rgb/hex -> treat as painted
-  })();
-  const hasBorder = (parseFloat(st.borderTopWidth) > 0 ||
-                     parseFloat(st.borderRightWidth) > 0 ||
-                     parseFloat(st.borderBottomWidth) > 0 ||
-                     parseFloat(st.borderLeftWidth) > 0) &&
-                    (st.borderTopColor !== "transparent" ||
-                     st.borderRightColor !== "transparent" ||
-                     st.borderBottomColor !== "transparent" ||
-                     st.borderLeftColor !== "transparent");
+  }
 
-  return paintsText || isMedia || bgHasImage || bgHasColor || hasBorder;
-};
+  // ---- Tap targets under 44x44 within the fold (only actionable elements)
+  const smallTapTargets = actionCandidates.filter((el) => {
+    const r = el.getBoundingClientRect();
+    return inViewport(r) && (r.width < 44 || r.height < 44);
+  }).length;
 
-// Collect only visible, in-viewport, *painted* elements
-const paintedInFold = Array.from(document.querySelectorAll("body *")).filter((el) => {
-  if (!isVisible(el)) return false;
-  if (!inViewport(el.getBoundingClientRect())) return false;
-  return hasPaint(el);
-});
+  // ---- Viewport meta present?
+  const hasViewportMeta = !!document.querySelector('meta[name="viewport"]');
 
-// Typography stats still based on visible elements in fold (not just painted)
-const allInFoldVisible = Array.from(document.querySelectorAll("body *")).filter(
-  (el) => isVisible(el) && inViewport(el.getBoundingClientRect())
-);
-let maxFont = 0, minFont = Infinity;
-for (const el of allInFoldVisible) {
-  const fs = parseFloat(getComputedStyle(el).fontSize || "0");
-  if (fs > 0) { if (fs > maxFont) maxFont = fs; if (fs < minFont) minFont = fs; }
-}
+  // ---- Overlays: large fixed/sticky with high z-index covering ≥30% of the fold
+  const overlayBlockers = Array.from(document.querySelectorAll("body *")).filter((el) => {
+    const st = getComputedStyle(el);
+    if (!["fixed", "sticky"].includes(st.position)) return false;
+    const z = parseInt(st.zIndex || "0", 10);
+    if (isNaN(z) || z < 1000) return false;
+    const r = el.getBoundingClientRect();
+    if (!inViewport(r)) return false;
+    const w = Math.max(0, Math.min(r.right, vpW) - Math.max(r.left, 0));
+    const h = Math.max(0, Math.min(r.bottom, vpH) - Math.max(r.top, 0));
+    const area = w * h;
+    return r.top <= 0 && area >= vpW * vpH * 0.3; // covers ≥30% of the first viewport
+  }).length;
 
-// Coverage via coarse grid over *painted* elements (union of areas)
-const ROWS = 40, COLS = 24;
-const cellW = vpW / COLS, cellH = vpH / ROWS;
-const covered = new Set();
-for (const el of paintedInFold) {
-  const r = el.getBoundingClientRect();
-  const x0 = Math.max(0, Math.floor(r.left / cellW));
-  const x1 = Math.min(COLS - 1, Math.floor((r.right - 0.01) / cellW));
-  const y0 = Math.max(0, Math.floor(r.top / cellH));
-  const y1 = Math.min(ROWS - 1, Math.floor((r.bottom - 0.01) / cellH));
-  for (let y = y0; y <= y1; y++) for (let x = x0; x <= x1; x++) covered.add(y * COLS + x);
-}
-const foldCoveragePct = Math.min(100, Math.round((covered.size / (ROWS * COLS)) * 100));
+  // ---- Safe-area CSS usage (approx; ignore cross-origin errors)
+  let usesSafeAreaCSS = false;
+  for (const ss of Array.from(document.styleSheets)) {
+    try {
+      for (const rule of Array.from(ss.cssRules)) {
+        if (rule.cssText && rule.cssText.includes("safe-area-inset")) {
+          usesSafeAreaCSS = true;
+          break;
+        }
+      }
+      if (usesSafeAreaCSS) break;
+    } catch {
+      // cross-origin stylesheet; skip
+    }
+  }
 
+  // ---- "Painted coverage" via coarse grid union (prevents overlapping double-count)
+  // We only count elements that "paint" (text, media, background color/image, or borders)
+  const PAINT_ALPHA_MIN = 0.05;
+  const hasPaint = (el) => {
+    const st = getComputedStyle(el);
 
+    // text paint
+    const text = (el.innerText || el.textContent || "").trim();
+    const fs = parseFloat(st.fontSize || "0");
+    const color = st.color || "rgba(0,0,0,1)";
+    let textAlpha = 1;
+    if (color.startsWith("rgba")) {
+      const parts = color.replace("rgba(", "").replace(")", "").split(",");
+      textAlpha = parseFloat(parts[3] || "1");
+    }
+    const paintsText = text.length > 0 && fs > 0 && textAlpha > PAINT_ALPHA_MIN;
+
+    // media/vector paint
+    const tag = el.tagName;
+    const isMedia = tag === "IMG" || tag === "VIDEO" || tag === "CANVAS" || tag === "SVG";
+
+    // backgrounds/borders
+    const bgImg = st.backgroundImage && st.backgroundImage !== "none";
+    const bgColor = st.backgroundColor || "";
+    let bgPaints = false;
+    if (bgColor && bgColor !== "transparent") {
+      if (bgColor.startsWith("rgba")) {
+        const parts = bgColor.replace("rgba(", "").replace(")", "").split(",");
+        const a = parseFloat(parts[3] || "1");
+        bgPaints = a > PAINT_ALPHA_MIN;
+      } else {
+        bgPaints = true; // rgb/hex
+      }
+    }
+    const borderWidths = [
+      parseFloat(st.borderTopWidth),
+      parseFloat(st.borderRightWidth),
+      parseFloat(st.borderBottomWidth),
+      parseFloat(st.borderLeftWidth),
+    ].filter((n) => n > 0).length;
+    const hasBorder = borderWidths > 0 &&
+      (st.borderTopColor !== "transparent" ||
+       st.borderRightColor !== "transparent" ||
+       st.borderBottomColor !== "transparent" ||
+       st.borderLeftColor !== "transparent");
+
+    return paintsText || isMedia || bgImg || bgPaints || hasBorder;
+  };
+
+  const paintedInFold = allInFoldVisible.filter(hasPaint);
+
+  // Grid resolution (tune as needed)
+  const ROWS = 40, COLS = 24;
+  const cellW = vpW / COLS, cellH = vpH / ROWS;
+  const covered = new Set(); // cell ids that are covered by any painted element
+
+  for (const el of paintedInFold) {
+    const r = el.getBoundingClientRect();
+    const x0 = Math.max(0, Math.floor(r.left / cellW));
+    const x1 = Math.min(COLS - 1, Math.floor((r.right - 0.01) / cellW));
+    const y0 = Math.max(0, Math.floor(r.top / cellH));
+    const y1 = Math.min(ROWS - 1, Math.floor((r.bottom - 0.01) / cellH));
+    for (let y = y0; y <= y1; y++) {
+      for (let x = x0; x <= x1; x++) {
+        covered.add(y * COLS + x);
+      }
+    }
+  }
+
+  const foldCoveragePct = Math.min(100, Math.round((covered.size / (ROWS * COLS)) * 100));
+
+  // ---- Return the audit payload
   return {
     firstCtaInFold,
     foldCoveragePct,
@@ -289,6 +377,7 @@ const foldCoveragePct = Math.min(100, Math.round((covered.size / (ROWS * COLS)) 
     usesSafeAreaCSS,
   };
 });
+
 
     const audit_ms = Date.now() - tAudit0;
 
