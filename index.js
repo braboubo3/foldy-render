@@ -199,99 +199,67 @@ app.post("/render", requireAuth, async (req, res) => {
     // --- DOM audit (runs in-page)
     const tAudit0 = Date.now();
     const ux = await page.evaluate(() => {
-      const vpH = window.innerHeight;
-      const vpW = window.innerWidth;
+const vpH = window.innerHeight;
+const vpW = window.innerWidth;
 
-      const isVisible = (el) => {
-        const r = el.getBoundingClientRect();
-        const st = getComputedStyle(el);
-        return r.width > 0 && r.height > 0 && st.visibility !== "hidden" && st.display !== "none";
-      };
+const isVisible = (el) => {
+  const r = el.getBoundingClientRect();
+  const st = getComputedStyle(el);
+  return r.width > 0 && r.height > 0 && st.visibility !== "hidden" && st.display !== "none";
+};
 
-      // Minimal CTA detector: primary verbs common on landers & PDPs
-      const isCTA = (el) =>
-        /buy|add to cart|add-to-cart|shop now|sign up|sign-up|get started|get-started|try|subscribe|join|book|order|download|contact/i.test(
-          (el.innerText || "").toLowerCase()
-        );
+// Elements intersecting the first viewport and visible
+const inFoldVisible = Array.from(document.querySelectorAll("body *")).filter((el) => {
+  if (!isVisible(el)) return false;
+  const r = el.getBoundingClientRect();
+  return r.top < vpH && r.bottom > 0 && r.left < vpW && r.right > 0;
+});
 
-      const ctaEls = Array.from(document.querySelectorAll("a,button,[role='button']")).filter(
-        (el) => isCTA(el)
-      );
-      const firstCtaInFold = ctaEls.some((el) => {
-        if (!isVisible(el)) return false;
-        const r = el.getBoundingClientRect();
-        return r.top >= 0 && r.top < vpH; // any part of CTA in first viewport
-      });
+// Font stats
+let maxFont = 0;
+let minFont = Infinity;
+for (const el of inFoldVisible) {
+  const fs = parseFloat(getComputedStyle(el).fontSize || "0");
+  if (fs > 0) {
+    if (fs > maxFont) maxFont = fs;
+    if (fs < minFont) minFont = fs;
+  }
+}
 
-      // Elements intersecting the fold
-      const inFold = Array.from(document.querySelectorAll("body *")).filter((el) => {
-        const r = el.getBoundingClientRect();
-        return r.top < vpH && r.bottom > 0 && r.left < vpW && r.right > 0;
-      });
+// Coverage via coarse grid (union of areas)
+const ROWS = 40;          // tune: 30–60 rows is fine
+const COLS = 24;          // tune: 20–30 cols is fine
+const cellW = vpW / COLS;
+const cellH = vpH / ROWS;
+const covered = new Set();
 
-      // Font size bounds + crude coverage proxy
-      let maxFont = 0;
-      let minFont = Infinity;
-      let coveredPx = 0; // total pixels occupied by elements in the fold
-      for (const el of inFold) {
-        const st = getComputedStyle(el);
-        const fs = parseFloat(st.fontSize || "0");
-        if (fs > 0) {
-          maxFont = Math.max(maxFont, fs);
-          minFont = Math.min(minFont, fs);
-        }
-        // area of intersection with viewport (very rough)
-        const r = el.getBoundingClientRect();
-        const w = Math.max(0, Math.min(r.right, vpW) - Math.max(r.left, 0));
-        const h = Math.max(0, Math.min(r.bottom, vpH) - Math.max(r.top, 0));
-        coveredPx += w * h;
-      }
-      const foldCoveragePct = Math.round((coveredPx / (vpW * vpH)) * 100);
+for (const el of inFoldVisible) {
+  const r = el.getBoundingClientRect();
+  const x0 = Math.max(0, Math.floor(r.left / cellW));
+  const x1 = Math.min(COLS - 1, Math.floor((r.right - 0.01) / cellW));
+  const y0 = Math.max(0, Math.floor(r.top / cellH));
+  const y1 = Math.min(ROWS - 1, Math.floor((r.bottom - 0.01) / cellH));
+  for (let y = y0; y <= y1; y++) {
+    for (let x = x0; x <= x1; x++) {
+      covered.add(y * COLS + x);
+    }
+  }
+}
 
-      // Tap targets under minimum size within the fold
-      const smallTapTargets = Array.from(
-        document.querySelectorAll("a,button,[role='button']")
-      ).filter((el) => {
-        const r = el.getBoundingClientRect();
-        return r.top < vpH && r.bottom > 0 && (r.width < 44 || r.height < 44);
-      }).length;
+const foldCoveragePct = Math.min(100, Math.round((covered.size / (ROWS * COLS)) * 100));
 
-      // Viewport meta present?
-      const hasViewportMeta = !!document.querySelector('meta[name="viewport"]');
+// Keep the rest of your audit values as-is, but return these:
+return {
+  firstCtaInFold,
+  foldCoveragePct,
+  maxFontPx: maxFont || 0,
+  minFontPx: Number.isFinite(minFont) ? minFont : 0,
+  smallTapTargets,
+  hasViewportMeta,
+  overlayBlockers,
+  usesSafeAreaCSS
+};
 
-      // Overlays: large fixed/sticky, high z-index, covering significant fold area
-      const overlayBlockers = Array.from(document.querySelectorAll("body *")).filter((el) => {
-        const st = getComputedStyle(el);
-        if (!["fixed", "sticky"].includes(st.position)) return false;
-        const z = parseInt(st.zIndex || "0", 10);
-        if (isNaN(z) || z < 1000) return false;
-        const r = el.getBoundingClientRect();
-        const w = Math.max(0, Math.min(r.right, vpW) - Math.max(r.left, 0));
-        const h = Math.max(0, Math.min(r.bottom, vpH) - Math.max(r.top, 0));
-        const area = w * h;
-        return r.top <= 0 && area >= vpW * vpH * 0.3; // covers ≥30% of fold
-      }).length;
-
-      // Safe-area check (approx): any stylesheet mentions safe-area-inset*
-      const usesSafeAreaCSS = Array.from(document.styleSheets).some((ss) => {
-        try {
-          return Array.from(ss.cssRules).some((r) => r.cssText.includes("safe-area-inset"));
-        } catch {
-          // cross-origin stylesheets may throw — ignore
-          return false;
-        }
-      });
-
-      return {
-        firstCtaInFold,
-        foldCoveragePct,
-        maxFontPx: maxFont || 0,
-        minFontPx: Number.isFinite(minFont) ? minFont : 0,
-        smallTapTargets,
-        hasViewportMeta,
-        overlayBlockers,
-        usesSafeAreaCSS,
-      };
     });
     const audit_ms = Date.now() - tAudit0;
 
