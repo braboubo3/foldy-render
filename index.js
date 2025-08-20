@@ -307,8 +307,6 @@ const ux = await page.evaluate(() => {
   };
 });
 
-
-    });
     const audit_ms = Date.now() - tAudit0;
 
     // --- Viewport screenshot (first fold only)
