@@ -10,3 +10,10 @@
     "playwright": "^1.45.0"
   }
 }
+{
+  "scripts": {
+    "start": "node index.js",
+    "dev": "nodemon --signal SIGTERM index.js"
+  },
+  "devDependencies": { "nodemon": "^3.0.0" }
+}
