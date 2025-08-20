@@ -202,12 +202,21 @@ app.post("/render", requireAuth, async (req, res) => {
     
 // Replace your current evaluate(...) with THIS:
 const ux = await page.evaluate(() => {
-  // ========= Viewport =========
+  /**
+   * Foldy in-page audit (runs inside the page)
+   * - CTA visibility, min/max font, small tap targets, overlays, viewport meta, safe-area usage
+   * - Coverage from UNION of:
+   *     • Foreground media rects (IMG/VIDEO/SVG/CANVAS)
+   *     • Glyph-tight rects from TEXT NODES (not element line boxes)
+   *   Then rasterized onto a coarse grid so overlaps aren’t double-counted.
+   */
+
+  // ---------- Viewport ----------
   const vpW = window.innerWidth;
   const vpH = window.innerHeight;
   const VP = { left: 0, top: 0, right: vpW, bottom: vpH, width: vpW, height: vpH };
 
-  // ========= Helpers =========
+  // ---------- Helpers ----------
   const inViewport = (r) => r.top < vpH && r.bottom > 0 && r.left < vpW && r.right > 0;
 
   const isVisible = (el) => {
@@ -218,18 +227,15 @@ const ux = await page.evaluate(() => {
     return r.width > 0 && r.height > 0;
   };
 
-  const intersect = (r, b = VP) => {
-    const left = Math.max(b.left, r.left);
-    const top = Math.max(b.top, r.top);
-    const right = Math.min(b.right, r.right);
-    const bottom = Math.min(b.bottom, r.bottom);
+  const intersect = (r) => {
+    const left = Math.max(0, r.left);
+    const top = Math.max(0, r.top);
+    const right = Math.min(vpW, r.right);
+    const bottom = Math.min(vpH, r.bottom);
     const w = Math.max(0, right - left);
     const h = Math.max(0, bottom - top);
     return w > 0 && h > 0 ? { left, top, right, bottom, width: w, height: h } : null;
   };
-
-  const getText = (el) => (el.innerText || el.textContent || "").trim().toLowerCase();
-  const getAria = (el) => (el.getAttribute("aria-label") || el.getAttribute("title") || "").trim().toLowerCase();
 
   const rgbaAlpha = (rgba) => {
     if (!rgba || !rgba.startsWith("rgba")) return 1;
@@ -237,12 +243,11 @@ const ux = await page.evaluate(() => {
     return parseFloat(p[3] || "1");
   };
 
-  const isMediaTag = (el) => {
-    const t = el.tagName;
-    return t === "IMG" || t === "VIDEO" || t === "CANVAS" || t === "SVG";
-  };
+  const getText = (el) => (el.innerText || el.textContent || "").trim().toLowerCase();
+  const getAria = (el) => (el.getAttribute("aria-label") || el.getAttribute("title") || "").trim().toLowerCase();
+  const isMediaTag = (el) => ["IMG","VIDEO","CANVAS","SVG"].includes(el.tagName);
 
-  // ========= CTA detection =========
+  // ---------- CTA detection ----------
   const CTA_RE = /(buy|add to cart|add-to-cart|shop now|sign up|sign-up|get started|get-started|try|subscribe|join|book|order|checkout|continue|download|contact)/i;
   const actionCandidates = Array.from(
     document.querySelectorAll('a,button,[role="button"],input[type="submit"],input[type="button"]')
@@ -253,28 +258,28 @@ const ux = await page.evaluate(() => {
     return CTA_RE.test(label) && inViewport(el.getBoundingClientRect());
   });
 
-  // ========= Visible elements in the fold (for fonts/taps) =========
+  // ---------- All visible elements intersecting the fold ----------
   const allInFoldVisible = Array.from(document.querySelectorAll("body *")).filter(
     (el) => isVisible(el) && inViewport(el.getBoundingClientRect())
   );
 
-  // Typography bounds
+  // ---------- Typography bounds ----------
   let maxFont = 0, minFont = Infinity;
   for (const el of allInFoldVisible) {
     const fs = parseFloat(getComputedStyle(el).fontSize || "0");
     if (fs > 0) { if (fs > maxFont) maxFont = fs; if (fs < minFont) minFont = fs; }
   }
 
-  // Small tap targets
+  // ---------- Small tap targets (<44x44) ----------
   const smallTapTargets = actionCandidates.filter((el) => {
     const r = el.getBoundingClientRect();
     return inViewport(r) && (r.width < 44 || r.height < 44);
   }).length;
 
-  // Viewport meta
+  // ---------- Viewport meta ----------
   const hasViewportMeta = !!document.querySelector('meta[name="viewport"]');
 
-  // Overlays (large fixed/sticky)
+  // ---------- Overlays (large fixed/sticky) ----------
   const overlayBlockers = Array.from(document.querySelectorAll("body *")).filter((el) => {
     const st = getComputedStyle(el);
     if (!["fixed", "sticky"].includes(st.position)) return false;
@@ -286,7 +291,7 @@ const ux = await page.evaluate(() => {
     return inter && inter.width * inter.height >= vpW * vpH * 0.3;
   }).length;
 
-  // Safe-area usage
+  // ---------- Safe-area CSS ----------
   let usesSafeAreaCSS = false;
   for (const ss of Array.from(document.styleSheets)) {
     try {
@@ -297,52 +302,59 @@ const ux = await page.evaluate(() => {
     } catch {}
   }
 
-  // ========= Build rects for coverage =========
+  // =========================================================
+  // Build content rects (glyph-tight) + painted rects
+  // =========================================================
 
-  // Content rects = foreground media + readable text line boxes (exclude BGs/wrappers)
-  const TEXT_LEN_MIN = 3;
-  const FONT_MIN = 12;
-  const contentRects = [];
+  const TEXT_LEN_MIN = 3;   // ignore 1–2 character crumbs
+  const FONT_MIN = 12;      // sub-12px often decorative on mobile
 
+  const contentRects = [];  // foreground media + glyph-tight text rects
+  const paintedRects = [];  // content rects + bg/border boxes (debug)
+
+  // 1) Foreground media → content rects
   for (const el of allInFoldVisible) {
-    const rEl = el.getBoundingClientRect();
+    if (!isMediaTag(el)) continue;
+    const inter = intersect(el.getBoundingClientRect());
+    if (inter) contentRects.push(inter);
+  }
 
-    if (isMediaTag(el)) {
-      const inter = intersect(rEl);
-      if (inter) contentRects.push(inter);
-      continue;
-    }
+  // 2) Text nodes → glyph-tight rects
+  // Walk text nodes inside each visible element; collect rects per text node.
+  const acceptText = { acceptNode: (n) =>
+    (n.nodeType === Node.TEXT_NODE && (n.textContent || "").trim().length >= TEXT_LEN_MIN)
+      ? NodeFilter.FILTER_ACCEPT : NodeFilter.FILTER_SKIP };
 
-    const st = getComputedStyle(el);
-    const text = (el.innerText || el.textContent || "").trim();
-    const fs = parseFloat(st.fontSize || "0");
-    const alpha = rgbaAlpha(st.color || "rgba(0,0,0,1)");
+  for (const root of allInFoldVisible) {
+    const stRoot = getComputedStyle(root);
+    const fsRoot = parseFloat(stRoot.fontSize || "0");
+    const alphaRoot = rgbaAlpha(stRoot.color || "rgba(0,0,0,1)");
+    if (fsRoot < FONT_MIN || alphaRoot <= 0.05) continue;
 
-    if (text.length >= TEXT_LEN_MIN && fs >= FONT_MIN && alpha > 0.05) {
+    const tw = document.createTreeWalker(root, NodeFilter.SHOW_TEXT, acceptText);
+    let node;
+    while ((node = tw.nextNode())) {
       try {
-        const range = document.createRange();
-        range.selectNodeContents(el);
-        const rects = Array.from(range.getClientRects());
+        const rng = document.createRange();
+        rng.selectNodeContents(node);
+        const rects = Array.from(rng.getClientRects());
         for (const rr of rects) {
           const inter = intersect(rr);
           if (!inter) continue;
-          // Ignore tiny fragments / line-height artifacts
-          if (inter.width < 2 || inter.height < fs * 0.4) continue;
+          // Filter tiny artifacts / line-height slivers
+          if (inter.width < 2 || inter.height < fsRoot * 0.4) continue;
           contentRects.push(inter);
         }
-      } catch {
-        // if selection fails (e.g., pseudo-element), skip
-      }
+      } catch { /* ignore selection failures */ }
     }
   }
 
-  // Painted rects = content rects + elements that visually paint (bg image/color or border)
-  const paintedRects = [...contentRects];
+  // 3) Painted rects = content + bg/border elements
+  // (for debugging/insight; not used in scoring)
   for (const el of allInFoldVisible) {
     if (isMediaTag(el)) continue; // already counted
     const st = getComputedStyle(el);
     let paints = false;
-
     if (st.backgroundImage && st.backgroundImage !== "none") paints = true;
     const bg = st.backgroundColor || "";
     if (!paints && bg && bg !== "transparent") {
@@ -354,16 +366,17 @@ const ux = await page.evaluate(() => {
         ["borderTopColor","borderRightColor","borderBottomColor","borderLeftColor"].some(k => (st[k]||"") !== "transparent");
       paints = hasBorder;
     }
-
     if (paints) {
       const inter = intersect(el.getBoundingClientRect());
       if (inter) paintedRects.push(inter);
     }
   }
 
-  // ========= Grid-union coverage from rect lists =========
+  // =========================================================
+  // Grid-union coverage (avoids overlap double-count)
+  // =========================================================
   const coverageFromRects = (rects) => {
-    const ROWS = 40, COLS = 24; // tune for speed/accuracy
+    const ROWS = 40, COLS = 24; // increase for more precision if needed
     const cellW = vpW / COLS, cellH = vpH / ROWS;
     const covered = new Set();
     for (const r of rects) {
@@ -379,7 +392,7 @@ const ux = await page.evaluate(() => {
   const foldCoveragePct    = coverageFromRects(contentRects);   // use for scoring
   const paintedCoveragePct = coverageFromRects(paintedRects);   // debug/insight
 
-  // ========= Return payload =========
+  // ---------- Return audit ----------
   return {
     firstCtaInFold,
     foldCoveragePct,
