@@ -1,34 +1,41 @@
 /**
- * foldy-render — Microservice
- * One request per device → headless Chromium → returns:
- *  - first-viewport screenshot (base64 PNG)
- *  - fold-focused DOM audit (CTA-in-fold, font sizes, tap targets, overlays, viewport meta, safe-area)
- *  - simple timings (nav/audit/screenshot/total)
+ * foldy-render — Express + Playwright microservice
  *
- * Auth: Bearer token in Authorization header (RENDER_TOKEN)
- * Security: basic SSRF allowlist (http/https only, no localhost/private ranges)
+ * Endpoints
+ *   GET  /health     -> warm/liveness
+ *   POST /render     -> { url, device, debugOverlay? }  (Authorization: Bearer <RENDER_TOKEN>)
  *
- * Tip: ensure package.json has:
- *  {
- *    "type": "module",
- *    "scripts": { "start": "node index.js", "postinstall": "npx playwright install chromium" }
- *  }
+ * Returns (abridged)
+ *   {
+ *     deviceMeta: { viewport, dpr, ua, label },
+ *     pngBase64: "<clean first-viewport PNG>",          // overlay removed (default)
+ *     // pngWithOverlayBase64: "<as-seen PNG>",         // only when debugOverlay=1
+ *     ux: {
+ *       firstCtaInFold, foldCoveragePct, visibleFoldCoveragePct,
+ *       paintedCoveragePct, overlayCoveragePct, overlayBlockers,
+ *       maxFontPx, minFontPx, smallTapTargets, hasViewportMeta, usesSafeAreaCSS
+ *     },
+ *     timings: { nav_ms, settle_ms, audit_ms, hide_ms, screenshot_ms, total_ms }
+ *   }
+ *
+ * Notes
+ * - Uses the official Playwright Docker image in production (all OS deps baked in).
+ * - One Chromium browser per process, one isolated context per request.
+ * - Basic SSRF guard (http/https only; blocks localhost/private ranges).
  */
 
 import express from "express";
 import { chromium, devices } from "playwright";
 
 const PORT = process.env.PORT || 3000;
-const AUTH = process.env.RENDER_TOKEN || "devtoken"; // set a strong secret in Replit secrets
+const AUTH = process.env.RENDER_TOKEN || "devtoken";
 
 const app = express();
-app.use(express.json({ limit: "8mb" })); // accept base64 payloads comfortably
+app.use(express.json({ limit: "8mb" }));
 
-/** -------------------------------------------------------
- * Device map (PoC approximations using built-in profiles)
- * - We override viewport to exact px we want for the fold.
- * - DPR/UA/etc. come from the Playwright device profile.
- * ------------------------------------------------------*/
+/* -------------------------------------------------------------------------- */
+/* Device presets (PoC). We override viewport for exact fold height/width.    */
+/* -------------------------------------------------------------------------- */
 const DEVICE_MAP = {
   iphone_se_2: {
     label: "iPhone SE (2nd gen)",
@@ -38,8 +45,7 @@ const DEVICE_MAP = {
   iphone_15_pro: {
     label: "iPhone 15 Pro",
     vp: { width: 393, height: 852 },
-    // close enough for PoC — Playwright doesn’t ship an “iPhone 15 Pro” preset yet
-    profile: devices["iPhone 13 Pro"],
+    profile: devices["iPhone 13 Pro"], // close enough preset
   },
   iphone_15_pro_max: {
     label: "iPhone 15 Pro Max",
@@ -58,79 +64,55 @@ const DEVICE_MAP = {
   },
 };
 
-/** ---------------------------
- * Simple auth middleware
- * --------------------------*/
+/* ------------------------------ Auth middleware --------------------------- */
 function requireAuth(req, res, next) {
   const token = (req.headers.authorization || "").replace(/^Bearer\s+/i, "");
-  if (!token || token !== AUTH) {
-    return res.status(401).json({ error: "unauthorized" });
-  }
+  if (!token || token !== AUTH) return res.status(401).json({ error: "unauthorized" });
   next();
 }
 
-/** ---------------------------------------------------
- * Basic SSRF guard: allow only http/https; block
- * localhost and RFC1918 private ranges by hostname.
- * NOTE: This does NOT resolve DNS → IP. For MVP.
- * --------------------------------------------------*/
+/* ------------------------------- SSRF guard --------------------------------
+ * Allow only http/https and block obvious internal hosts. (MVP guard; does
+ * not resolve DNS to IP — that’s OK for our use case here.)
+ * -------------------------------------------------------------------------- */
 function isAllowedUrl(u) {
   try {
     const { protocol, hostname } = new URL(u);
     if (!/^https?:$/.test(protocol)) return false;
-    // block obvious internal targets
     if (
       hostname === "localhost" ||
       hostname === "127.0.0.1" ||
       /^10\./.test(hostname) ||
       /^192\.168\./.test(hostname) ||
       /^172\.(1[6-9]|2\d|3[0-1])\./.test(hostname)
-    ) {
-      return false;
-    }
+    ) return false;
     return true;
   } catch {
     return false;
   }
 }
 
-/** ---------------------------------
- * Keep one browser per process
- *  - contexts/pages are per request
- *  - auto-relaunch if disconnected
- * --------------------------------*/
+/* --------------------------- Playwright browser --------------------------- */
 let browser = null;
 
 async function getBrowser() {
   if (browser && browser.isConnected()) return browser;
-  if (browser) {
-    try {
-      await browser.close();
-    } catch {
-      /* ignore */
-    }
-  }
+  if (browser) try { await browser.close(); } catch {}
   browser = await chromium.launch({
     headless: true,
     args: [
       "--no-sandbox",
       "--disable-setuid-sandbox",
-      "--disable-dev-shm-usage", // small /dev/shm in tiny containers
+      "--disable-dev-shm-usage",
       "--disable-background-timer-throttling",
       "--disable-renderer-backgrounding",
     ],
   });
-  browser.on("disconnected", () => {
-    browser = null;
-  });
+  browser.on("disconnected", () => { browser = null; });
   return browser;
 }
 
-/** ---------------
- * Health endpoint
- *  - warms the pod
- *  - ensures browser is ready
- * ---------------*/
+/* --------------------------------- Health --------------------------------- */
 app.get("/health", async (_req, res) => {
   try {
     await getBrowser();
@@ -140,280 +122,301 @@ app.get("/health", async (_req, res) => {
   }
 });
 
-/** -----------------------------------------------
- * Main endpoint: /render
- * Body: { url: string, device: keyof DEVICE_MAP }
- * Returns:
- *  {
- *    device, deviceMeta: { viewport, dpr, ua },
- *    pngBase64, ux: { ...fold heuristics... },
- *    timings: { nav_ms, settle_ms, audit_ms, screenshot_ms, total_ms }
- *  }
- * ----------------------------------------------*/
+/* -------------------------- Overlay hider (Node) -------------------------- */
+/** Hides elements marked by the in-page audit + common CMPs; unlocks scroll. */
+async function hideOverlaysAndUnlock(page) {
+  await page.evaluate(() => {
+    // Hide anything our audit marked
+    document.querySelectorAll('[data-foldy-overlay="1"]').forEach((el) => {
+      el.setAttribute("data-foldy-overlay-hidden", "1");
+      el.style.setProperty("display", "none", "important");
+      el.style.setProperty("visibility", "hidden", "important");
+    });
+
+    // Extra heuristics for cookie/consent UIs
+    const selectors = [
+      '[id*="cookie" i]','[class*="cookie" i]',
+      '[id*="consent" i]','[class*="consent" i]',
+      '[id*="gdpr" i]','[class*="gdpr" i]',
+      '[role="dialog"]',
+    ];
+    document.querySelectorAll(selectors.join(",")).forEach((el) => {
+      const st = getComputedStyle(el);
+      if (st.position === "fixed" || st.position === "sticky") {
+        el.setAttribute("data-foldy-overlay-hidden", "1");
+        el.style.setProperty("display", "none", "important");
+        el.style.setProperty("visibility", "hidden", "important");
+      }
+    });
+
+    // Many CMPs lock scroll; unlock it
+    document.documentElement.style.setProperty("overflow", "auto", "important");
+    document.body.style.setProperty("overflow", "auto", "important");
+    document.body.classList.remove("modal-open", "overflow-hidden", "disable-scroll");
+  });
+}
+
+/* --------------------------------- /render --------------------------------
+ * Body: { url: string, device: keyof DEVICE_MAP, debugOverlay?: boolean }
+ * Returns: clean screenshot (overlay removed) + fold audit (overlay-excluded).
+ * -------------------------------------------------------------------------- */
 app.post("/render", requireAuth, async (req, res) => {
   const { url, device } = req.body || {};
+  const debugOverlay =
+    (req.body && (req.body.debugOverlay === true || req.body.debugOverlay === "1")) ||
+    (req.query && (req.query.debugOverlay === "1" || req.query.debugOverlay === "true"));
+
   if (!url || !device || !DEVICE_MAP[device] || !isAllowedUrl(url)) {
     return res.status(400).json({ error: "bad input" });
   }
 
   const start = Date.now();
-  let context; // ensure close in finally
+  let context = null;
 
   try {
     const b = await getBrowser();
     const conf = DEVICE_MAP[device];
 
-    // One isolated context per job, with our profile + exact viewport
     context = await b.newContext({
       ...conf.profile,
-      viewport: conf.vp,
+      viewport: conf.vp, // enforce exact fold dimensions
     });
 
     const page = await context.newPage();
     page.setDefaultNavigationTimeout(15000);
     page.setDefaultTimeout(15000);
 
-    // Optional: block heavy third-parties to stabilize rendering & reduce CPU
+    // Light request interception to speed up/stabilize loads
     await page.route("**/*", (route) => {
       const u = route.request().url();
       if (
         /\.(mp4|mov|avi|m4v|webm)$/i.test(u) ||
-        /(hotjar|fullstory|segment|google-analytics|gtm|optimizely|clarity|doubleclick)/i.test(
-          u
-        )
-      ) {
-        return route.abort();
-      }
+        /(hotjar|fullstory|segment|google-analytics|gtm|optimizely|clarity|doubleclick)/i.test(u)
+      ) return route.abort();
       return route.continue();
     });
 
-    // --- Navigate & settle
+    // Navigate & settle
     const tNav0 = Date.now();
     await page.goto(url, { waitUntil: "networkidle" });
     const nav_ms = Date.now() - tNav0;
 
     const tSettle0 = Date.now();
-    await page.waitForTimeout(800); // allow late JS to settle
+    await page.waitForTimeout(800);
     const settle_ms = Date.now() - tSettle0;
 
-    // --- DOM audit (runs in-page)
+    /* ----------------------------- In-page audit ---------------------------- */
     const tAudit0 = Date.now();
+    const ux = await page.evaluate(() => {
+      const vpW = window.innerWidth, vpH = window.innerHeight;
+      const VP = { left: 0, top: 0, right: vpW, bottom: vpH, width: vpW, height: vpH };
 
-    
-// Replace your current evaluate(...) with THIS:
-const ux = await page.evaluate(() => {
-  /**
-   * Foldy in-page audit (runs inside the page)
-   * - CTA visibility, min/max font, small tap targets, overlays, viewport meta, safe-area usage
-   * - Coverage from UNION of:
-   *     • Foreground media rects (IMG/VIDEO/SVG/CANVAS)
-   *     • Glyph-tight rects from TEXT NODES (not element line boxes)
-   *   Then rasterized onto a coarse grid so overlaps aren’t double-counted.
-   */
+      const inViewport = (r) => r.top < vpH && r.bottom > 0 && r.left < vpW && r.right > 0;
+      const isVisible = (el) => {
+        const st = getComputedStyle(el);
+        if (st.visibility === "hidden" || st.display === "none" || st.opacity === "0") return false;
+        const r = el.getBoundingClientRect();
+        return r.width > 0 && r.height > 0;
+      };
+      const intersect = (r) => {
+        const left = Math.max(0, r.left), top = Math.max(0, r.top);
+        const right = Math.min(vpW, r.right), bottom = Math.min(vpH, r.bottom);
+        const w = Math.max(0, right - left), h = Math.max(0, bottom - top);
+        return w > 0 && h > 0 ? { left, top, right, bottom, width: w, height: h } : null;
+      };
+      const rgbaAlpha = (rgba) => {
+        if (!rgba || !rgba.startsWith("rgba")) return 1;
+        const p = rgba.replace(/^rgba\(|\)$/g, "").split(",");
+        return parseFloat(p[3] || "1");
+      };
+      const getText = (el) => (el.innerText || el.textContent || "").trim().toLowerCase();
+      const getAria = (el) => (el.getAttribute("aria-label") || el.getAttribute("title") || "").trim().toLowerCase();
+      const isMediaTag = (el) => ["IMG","VIDEO","CANVAS","SVG"].includes(el.tagName);
 
-  // ---------- Viewport ----------
-  const vpW = window.innerWidth;
-  const vpH = window.innerHeight;
-  const VP = { left: 0, top: 0, right: vpW, bottom: vpH, width: vpW, height: vpH };
+      // CTA visible in-fold?
+      const CTA_RE = /(buy|add to cart|add-to-cart|shop now|sign up|sign-up|get started|get-started|try|subscribe|join|book|order|checkout|continue|download|contact)/i;
+      const actionable = Array.from(document.querySelectorAll('a,button,[role="button"],input[type="submit"],input[type="button"]'))
+        .filter((el) => isVisible(el) && !el.disabled && getComputedStyle(el).cursor !== "default");
+      const firstCtaInFold = actionable.some((el) =>
+        CTA_RE.test(getText(el) || getAria(el) || (el.value || "")) && inViewport(el.getBoundingClientRect())
+      );
 
-  // ---------- Helpers ----------
-  const inViewport = (r) => r.top < vpH && r.bottom > 0 && r.left < vpW && r.right > 0;
+      // All visible elements intersecting the fold
+      const allInFoldVisible = Array.from(document.querySelectorAll("body *"))
+        .filter((el) => isVisible(el) && inViewport(el.getBoundingClientRect()));
 
-  const isVisible = (el) => {
-    const st = getComputedStyle(el);
-    if (st.visibility === "hidden" || st.display === "none" || st.opacity === "0") return false;
-    if (st.pointerEvents === "none") return false;
-    const r = el.getBoundingClientRect();
-    return r.width > 0 && r.height > 0;
-  };
-
-  const intersect = (r) => {
-    const left = Math.max(0, r.left);
-    const top = Math.max(0, r.top);
-    const right = Math.min(vpW, r.right);
-    const bottom = Math.min(vpH, r.bottom);
-    const w = Math.max(0, right - left);
-    const h = Math.max(0, bottom - top);
-    return w > 0 && h > 0 ? { left, top, right, bottom, width: w, height: h } : null;
-  };
-
-  const rgbaAlpha = (rgba) => {
-    if (!rgba || !rgba.startsWith("rgba")) return 1;
-    const p = rgba.replace(/^rgba\(|\)$/g, "").split(",");
-    return parseFloat(p[3] || "1");
-  };
-
-  const getText = (el) => (el.innerText || el.textContent || "").trim().toLowerCase();
-  const getAria = (el) => (el.getAttribute("aria-label") || el.getAttribute("title") || "").trim().toLowerCase();
-  const isMediaTag = (el) => ["IMG","VIDEO","CANVAS","SVG"].includes(el.tagName);
-
-  // ---------- CTA detection ----------
-  const CTA_RE = /(buy|add to cart|add-to-cart|shop now|sign up|sign-up|get started|get-started|try|subscribe|join|book|order|checkout|continue|download|contact)/i;
-  const actionCandidates = Array.from(
-    document.querySelectorAll('a,button,[role="button"],input[type="submit"],input[type="button"]')
-  ).filter((el) => isVisible(el) && !el.disabled && getComputedStyle(el).cursor !== "default");
-
-  const firstCtaInFold = actionCandidates.some((el) => {
-    const label = getText(el) || getAria(el) || (el.value || "").toLowerCase();
-    return CTA_RE.test(label) && inViewport(el.getBoundingClientRect());
-  });
-
-  // ---------- All visible elements intersecting the fold ----------
-  const allInFoldVisible = Array.from(document.querySelectorAll("body *")).filter(
-    (el) => isVisible(el) && inViewport(el.getBoundingClientRect())
-  );
-
-  // ---------- Typography bounds ----------
-  let maxFont = 0, minFont = Infinity;
-  for (const el of allInFoldVisible) {
-    const fs = parseFloat(getComputedStyle(el).fontSize || "0");
-    if (fs > 0) { if (fs > maxFont) maxFont = fs; if (fs < minFont) minFont = fs; }
-  }
-
-  // ---------- Small tap targets (<44x44) ----------
-  const smallTapTargets = actionCandidates.filter((el) => {
-    const r = el.getBoundingClientRect();
-    return inViewport(r) && (r.width < 44 || r.height < 44);
-  }).length;
-
-  // ---------- Viewport meta ----------
-  const hasViewportMeta = !!document.querySelector('meta[name="viewport"]');
-
-  // ---------- Overlays (large fixed/sticky) ----------
-  const overlayBlockers = Array.from(document.querySelectorAll("body *")).filter((el) => {
-    const st = getComputedStyle(el);
-    if (!["fixed", "sticky"].includes(st.position)) return false;
-    const z = parseInt(st.zIndex || "0", 10);
-    if (isNaN(z) || z < 1000) return false;
-    const r = el.getBoundingClientRect();
-    if (!inViewport(r)) return false;
-    const inter = intersect(r);
-    return inter && inter.width * inter.height >= vpW * vpH * 0.3;
-  }).length;
-
-  // ---------- Safe-area CSS ----------
-  let usesSafeAreaCSS = false;
-  for (const ss of Array.from(document.styleSheets)) {
-    try {
-      for (const rule of Array.from(ss.cssRules)) {
-        if (rule.cssText && rule.cssText.includes("safe-area-inset")) { usesSafeAreaCSS = true; break; }
+      // Typography bounds in fold
+      let maxFont = 0, minFont = Infinity;
+      for (const el of allInFoldVisible) {
+        const fs = parseFloat(getComputedStyle(el).fontSize || "0");
+        if (fs > 0) { if (fs > maxFont) maxFont = fs; if (fs < minFont) minFont = fs; }
       }
-      if (usesSafeAreaCSS) break;
-    } catch {}
-  }
 
-  // =========================================================
-  // Build content rects (glyph-tight) + painted rects
-  // =========================================================
+      // Small tap targets in fold
+      const smallTapTargets = actionable.filter((el) => {
+        const r = el.getBoundingClientRect();
+        return inViewport(r) && (r.width < 44 || r.height < 44);
+      }).length;
 
-  const TEXT_LEN_MIN = 3;   // ignore 1–2 character crumbs
-  const FONT_MIN = 12;      // sub-12px often decorative on mobile
+      // Viewport meta
+      const hasViewportMeta = !!document.querySelector('meta[name="viewport"]');
 
-  const contentRects = [];  // foreground media + glyph-tight text rects
-  const paintedRects = [];  // content rects + bg/border boxes (debug)
+      // Safe-area CSS (approx)
+      let usesSafeAreaCSS = false;
+      for (const ss of Array.from(document.styleSheets)) {
+        try {
+          for (const rule of Array.from(ss.cssRules)) {
+            if (rule.cssText && rule.cssText.includes("safe-area-inset")) { usesSafeAreaCSS = true; break; }
+          }
+          if (usesSafeAreaCSS) break;
+        } catch {}
+      }
 
-  // 1) Foreground media → content rects
-  for (const el of allInFoldVisible) {
-    if (!isMediaTag(el)) continue;
-    const inter = intersect(el.getBoundingClientRect());
-    if (inter) contentRects.push(inter);
-  }
+      /* ------------------------- Overlay detection ------------------------- */
+      const overlayCandidates = Array.from(document.querySelectorAll("body *")).filter((el) => {
+        if (!isVisible(el)) return false;
+        const st = getComputedStyle(el);
+        if (!["fixed","sticky"].includes(st.position)) return false;
+        const r = el.getBoundingClientRect(); if (!inViewport(r)) return false;
+        const inter = intersect(r); if (!inter) return false;
+        const areaPct = (inter.width * inter.height) / (vpW * vpH);
+        const z = parseInt(st.zIndex || "0", 10) || 0;
+        if (areaPct >= 0.15 && z >= 100) return true; // sizable overlay
+        const hint = (el.id + " " + el.className + " " + (el.getAttribute("role") || "") + " " + (el.getAttribute("aria-label") || "")).toLowerCase();
+        return /(cookie|consent|gdpr|privacy|cmp)/.test(hint);
+      });
 
-  // 2) Text nodes → glyph-tight rects
-  // Walk text nodes inside each visible element; collect rects per text node.
-  const acceptText = { acceptNode: (n) =>
-    (n.nodeType === Node.TEXT_NODE && (n.textContent || "").trim().length >= TEXT_LEN_MIN)
-      ? NodeFilter.FILTER_ACCEPT : NodeFilter.FILTER_SKIP };
+      // Mark overlays so Node can hide them before screenshot
+      overlayCandidates.forEach((el) => el.setAttribute("data-foldy-overlay", "1"));
 
-  for (const root of allInFoldVisible) {
-    const stRoot = getComputedStyle(root);
-    const fsRoot = parseFloat(stRoot.fontSize || "0");
-    const alphaRoot = rgbaAlpha(stRoot.color || "rgba(0,0,0,1)");
-    if (fsRoot < FONT_MIN || alphaRoot <= 0.05) continue;
+      const overlayRects = overlayCandidates
+        .map((el) => intersect(el.getBoundingClientRect()))
+        .filter(Boolean);
 
-    const tw = document.createTreeWalker(root, NodeFilter.SHOW_TEXT, acceptText);
-    let node;
-    while ((node = tw.nextNode())) {
-      try {
-        const rng = document.createRange();
-        rng.selectNodeContents(node);
-        const rects = Array.from(rng.getClientRects());
-        for (const rr of rects) {
-          const inter = intersect(rr);
-          if (!inter) continue;
-          // Filter tiny artifacts / line-height slivers
-          if (inter.width < 2 || inter.height < fsRoot * 0.4) continue;
-          contentRects.push(inter);
+      // "Blockers" = very large/top-covering overlays
+      const overlayBlockers = overlayCandidates.filter((el) => {
+        const r = el.getBoundingClientRect();
+        const inter = intersect(r);
+        const areaPct = inter ? (inter.width * inter.height) / (vpW * vpH) : 0;
+        const topCover = r.top <= 0 && r.height >= vpH * 0.25;
+        return areaPct >= 0.30 || topCover;
+      }).length;
+
+      /* ------------------ Content rects (glyph-tight) ------------------ */
+      const TEXT_LEN_MIN = 3, FONT_MIN = 12;
+      const contentRects = [];
+
+      // Foreground media
+      for (const el of allInFoldVisible) {
+        if (!isMediaTag(el)) continue;
+        const i = intersect(el.getBoundingClientRect()); if (i) contentRects.push(i);
+      }
+
+      // Text nodes
+      const acceptText = { acceptNode: (n) =>
+        (n.nodeType === Node.TEXT_NODE && (n.textContent || "").trim().length >= TEXT_LEN_MIN)
+          ? NodeFilter.FILTER_ACCEPT : NodeFilter.FILTER_SKIP };
+      for (const root of allInFoldVisible) {
+        const stRoot = getComputedStyle(root);
+        const fsRoot = parseFloat(stRoot.fontSize || "0");
+        const alphaRoot = rgbaAlpha(stRoot.color || "rgba(0,0,0,1)");
+        if (fsRoot < FONT_MIN || alphaRoot <= 0.05) continue;
+
+        const tw = document.createTreeWalker(root, NodeFilter.SHOW_TEXT, acceptText);
+        let node;
+        while ((node = tw.nextNode())) {
+          try {
+            const rng = document.createRange(); rng.selectNodeContents(node);
+            const rects = Array.from(rng.getClientRects());
+            for (const rr of rects) {
+              const i = intersect(rr); if (!i) continue;
+              if (i.width < 2 || i.height < fsRoot * 0.4) continue; // filter slivers
+              contentRects.push(i);
+            }
+          } catch {}
         }
-      } catch { /* ignore selection failures */ }
-    }
-  }
+      }
 
-  // 3) Painted rects = content + bg/border elements
-  // (for debugging/insight; not used in scoring)
-  for (const el of allInFoldVisible) {
-    if (isMediaTag(el)) continue; // already counted
-    const st = getComputedStyle(el);
-    let paints = false;
-    if (st.backgroundImage && st.backgroundImage !== "none") paints = true;
-    const bg = st.backgroundColor || "";
-    if (!paints && bg && bg !== "transparent") {
-      paints = !bg.startsWith("rgba") || rgbaAlpha(bg) > 0.05;
-    }
-    if (!paints) {
-      const hasBorder =
-        ["borderTopWidth","borderRightWidth","borderBottomWidth","borderLeftWidth"].some(k => parseFloat(st[k]) > 0) &&
-        ["borderTopColor","borderRightColor","borderBottomColor","borderLeftColor"].some(k => (st[k]||"") !== "transparent");
-      paints = hasBorder;
-    }
-    if (paints) {
-      const inter = intersect(el.getBoundingClientRect());
-      if (inter) paintedRects.push(inter);
-    }
-  }
+      // Painted rects (debug/insight)
+      const paintedRects = [...contentRects];
+      for (const el of allInFoldVisible) {
+        if (isMediaTag(el)) continue;
+        const st = getComputedStyle(el);
+        let paints = false;
+        if (st.backgroundImage && st.backgroundImage !== "none") paints = true;
+        const bg = st.backgroundColor || "";
+        if (!paints && bg && bg !== "transparent") paints = !bg.startsWith("rgba") || rgbaAlpha(bg) > 0.05;
+        if (!paints) {
+          const hasBorder =
+            ["borderTopWidth","borderRightWidth","borderBottomWidth","borderLeftWidth"].some(k => parseFloat(st[k]) > 0) &&
+            ["borderTopColor","borderRightColor","borderBottomColor","borderLeftColor"].some(k => (st[k]||"") !== "transparent");
+          paints = hasBorder;
+        }
+        if (paints) { const i = intersect(el.getBoundingClientRect()); if (i) paintedRects.push(i); }
+      }
 
-  // =========================================================
-  // Grid-union coverage (avoids overlap double-count)
-  // =========================================================
-  const coverageFromRects = (rects) => {
-    const ROWS = 40, COLS = 24; // increase for more precision if needed
-    const cellW = vpW / COLS, cellH = vpH / ROWS;
-    const covered = new Set();
-    for (const r of rects) {
-      const x0 = Math.max(0, Math.floor(r.left / cellW));
-      const x1 = Math.min(COLS - 1, Math.floor((r.right - 0.01) / cellW));
-      const y0 = Math.max(0, Math.floor(r.top / cellH));
-      const y1 = Math.min(ROWS - 1, Math.floor((r.bottom - 0.01) / cellH));
-      for (let y = y0; y <= y1; y++) for (let x = x0; x <= x1; x++) covered.add(y * COLS + x);
-    }
-    return Math.min(100, Math.round((covered.size / (ROWS * COLS)) * 100));
-  };
+      // Grid union helpers
+      const ROWS = 40, COLS = 24, cellW = vpW / COLS, cellH = vpH / ROWS;
+      const toCells = (rects) => {
+        const set = new Set();
+        for (const r of rects) {
+          const x0 = Math.max(0, Math.floor(r.left / cellW));
+          const x1 = Math.min(COLS - 1, Math.floor((r.right - 0.01) / cellW));
+          const y0 = Math.max(0, Math.floor(r.top / cellH));
+          const y1 = Math.min(ROWS - 1, Math.floor((r.bottom - 0.01) / cellH));
+          for (let y = y0; y <= y1; y++) for (let x = x0; x <= x1; x++) set.add(y * COLS + x);
+        }
+        return set;
+      };
+      const pct = (set) => Math.min(100, Math.round((set.size / (ROWS * COLS)) * 100));
 
-  const foldCoveragePct    = coverageFromRects(contentRects);   // use for scoring
-  const paintedCoveragePct = coverageFromRects(paintedRects);   // debug/insight
+      const contentCells = toCells(contentRects);
+      const paintedCells = toCells(paintedRects);
+      const overlayCells = toCells(overlayRects);
 
-  // ---------- Return audit ----------
-  return {
-    firstCtaInFold,
-    foldCoveragePct,
-    paintedCoveragePct,
-    maxFontPx: maxFont || 0,
-    minFontPx: Number.isFinite(minFont) ? minFont : 0,
-    smallTapTargets,
-    hasViewportMeta,
-    overlayBlockers,
-    usesSafeAreaCSS
-  };
-});
+      const visibleFoldCoveragePct = pct(contentCells);           // includes overlay
+      const overlayCoveragePct = pct(overlayCells);
+      const underlayCells = new Set([...contentCells].filter((id) => !overlayCells.has(id)));
+      const foldCoveragePct = pct(underlayCells);                  // EXCLUDES overlay (use for score)
 
-
-
-
+      return {
+        firstCtaInFold,
+        foldCoveragePct,                // clean / baseline
+        visibleFoldCoveragePct,         // as-seen
+        paintedCoveragePct: pct(paintedCells),
+        overlayCoveragePct,
+        overlayBlockers,
+        overlayElemsMarked: overlayCandidates.length,
+        maxFontPx: maxFont || 0,
+        minFontPx: Number.isFinite(minFont) ? minFont : 0,
+        smallTapTargets,
+        hasViewportMeta,
+        usesSafeAreaCSS
+      };
+    });
     const audit_ms = Date.now() - tAudit0;
 
-    // --- Viewport screenshot (first fold only)
+    /* ------------------- Screenshots (clean-only by default) ------------------- */
+    const { width, height } = conf.vp;
+
+    // Optional: with-overlay screenshot for debugging
+    let pngWithOverlayBase64 = null;
+    if (debugOverlay) {
+      const bufOverlay = await page.screenshot({
+        type: "png",
+        fullPage: false,
+        clip: { x: 0, y: 0, width, height },
+      });
+      pngWithOverlayBase64 = bufOverlay.toString("base64");
+    }
+
+    // Hide overlays + settle a moment
+    const tHide0 = Date.now();
+    await hideOverlaysAndUnlock(page);
+    await page.waitForTimeout(120);
+    const hide_ms = Date.now() - tHide0;
+
     const tShot0 = Date.now();
-    const { width, height } = DEVICE_MAP[device].vp;
     const buf = await page.screenshot({
       type: "png",
       fullPage: false,
@@ -422,47 +425,44 @@ const ux = await page.evaluate(() => {
     const pngBase64 = buf.toString("base64");
     const screenshot_ms = Date.now() - tShot0;
 
-    // --- Response
+    // Device meta
     const meta = {
       viewport: { width, height },
-      dpr: DEVICE_MAP[device].profile.deviceScaleFactor || 1,
-      ua: DEVICE_MAP[device].profile.userAgent || null,
-      label: DEVICE_MAP[device].label,
+      dpr: conf.profile.deviceScaleFactor || 1,
+      ua: conf.profile.userAgent || null,
+      label: conf.label,
     };
 
-    res.json({
+    // Build response
+    const payload = {
       device,
       deviceMeta: meta,
-      pngBase64,
+      pngBase64, // CLEAN (overlay removed)
       ux,
       timings: {
         nav_ms,
         settle_ms,
         audit_ms,
+        hide_ms,
         screenshot_ms,
         total_ms: Date.now() - start,
       },
-    });
+    };
+    if (debugOverlay && pngWithOverlayBase64) {
+      payload.pngWithOverlayBase64 = pngWithOverlayBase64; // optional
+    }
+
+    res.json(payload);
   } catch (e) {
-    // Return partial timings if we have them; n8n can decide to retry
     res.status(500).json({ error: String(e) });
   } finally {
-    // Always clean up the isolated context
-    try {
-      if (context) await context.close();
-    } catch {
-      /* ignore */
-    }
+    try { if (context) await context.close(); } catch {}
   }
 });
 
-/** Graceful shutdown (helps in hosted envs) */
+/* --------------------------- Graceful shutdown ---------------------------- */
 process.on("SIGTERM", async () => {
-  try {
-    if (browser) await browser.close();
-  } finally {
-    process.exit(0);
-  }
+  try { if (browser) await browser.close(); } finally { process.exit(0); }
 });
 
 app.listen(PORT, () => {
