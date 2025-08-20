@@ -202,12 +202,14 @@ app.post("/render", requireAuth, async (req, res) => {
     
 // Replace your current evaluate(...) with THIS:
 const ux = await page.evaluate(() => {
-  // ======== Viewport ========
+  // ========= Viewport =========
   const vpW = window.innerWidth;
   const vpH = window.innerHeight;
+  const VP = { left: 0, top: 0, right: vpW, bottom: vpH, width: vpW, height: vpH };
 
-  // ======== Helpers ========
+  // ========= Helpers =========
   const inViewport = (r) => r.top < vpH && r.bottom > 0 && r.left < vpW && r.right > 0;
+
   const isVisible = (el) => {
     const st = getComputedStyle(el);
     if (st.visibility === "hidden" || st.display === "none" || st.opacity === "0") return false;
@@ -215,10 +217,32 @@ const ux = await page.evaluate(() => {
     const r = el.getBoundingClientRect();
     return r.width > 0 && r.height > 0;
   };
+
+  const intersect = (r, b = VP) => {
+    const left = Math.max(b.left, r.left);
+    const top = Math.max(b.top, r.top);
+    const right = Math.min(b.right, r.right);
+    const bottom = Math.min(b.bottom, r.bottom);
+    const w = Math.max(0, right - left);
+    const h = Math.max(0, bottom - top);
+    return w > 0 && h > 0 ? { left, top, right, bottom, width: w, height: h } : null;
+  };
+
   const getText = (el) => (el.innerText || el.textContent || "").trim().toLowerCase();
   const getAria = (el) => (el.getAttribute("aria-label") || el.getAttribute("title") || "").trim().toLowerCase();
 
-  // ======== CTA detection ========
+  const rgbaAlpha = (rgba) => {
+    if (!rgba || !rgba.startsWith("rgba")) return 1;
+    const p = rgba.replace(/^rgba\(|\)$/g, "").split(",");
+    return parseFloat(p[3] || "1");
+  };
+
+  const isMediaTag = (el) => {
+    const t = el.tagName;
+    return t === "IMG" || t === "VIDEO" || t === "CANVAS" || t === "SVG";
+  };
+
+  // ========= CTA detection =========
   const CTA_RE = /(buy|add to cart|add-to-cart|shop now|sign up|sign-up|get started|get-started|try|subscribe|join|book|order|checkout|continue|download|contact)/i;
   const actionCandidates = Array.from(
     document.querySelectorAll('a,button,[role="button"],input[type="submit"],input[type="button"]')
@@ -226,11 +250,10 @@ const ux = await page.evaluate(() => {
 
   const firstCtaInFold = actionCandidates.some((el) => {
     const label = getText(el) || getAria(el) || (el.value || "").toLowerCase();
-    if (!CTA_RE.test(label)) return false;
-    return inViewport(el.getBoundingClientRect());
+    return CTA_RE.test(label) && inViewport(el.getBoundingClientRect());
   });
 
-  // ======== Visible elements in the fold (for fonts/taps) ========
+  // ========= Visible elements in the fold (for fonts/taps) =========
   const allInFoldVisible = Array.from(document.querySelectorAll("body *")).filter(
     (el) => isVisible(el) && inViewport(el.getBoundingClientRect())
   );
@@ -259,9 +282,8 @@ const ux = await page.evaluate(() => {
     if (isNaN(z) || z < 1000) return false;
     const r = el.getBoundingClientRect();
     if (!inViewport(r)) return false;
-    const w = Math.max(0, Math.min(r.right, vpW) - Math.max(r.left, 0));
-    const h = Math.max(0, Math.min(r.bottom, vpH) - Math.max(r.top, 0));
-    return r.top <= 0 && w * h >= vpW * vpH * 0.3;
+    const inter = intersect(r);
+    return inter && inter.width * inter.height >= vpW * vpH * 0.3;
   }).length;
 
   // Safe-area usage
@@ -275,112 +297,93 @@ const ux = await page.evaluate(() => {
     } catch {}
   }
 
-  // ======== Coverage via point sampling (glyph-aware) ========
-  const ROWS = 36, COLS = 20;         // tweak for accuracy/speed
-  const cellW = vpW / COLS, cellH = vpH / ROWS;
+  // ========= Build rects for coverage =========
 
-  const isMediaTag = (el) => {
-    const t = el.tagName;
-    return t === "IMG" || t === "VIDEO" || t === "CANVAS" || t === "SVG";
-  };
+  // Content rects = foreground media + readable text line boxes (exclude BGs/wrappers)
+  const TEXT_LEN_MIN = 3;
+  const FONT_MIN = 12;
+  const contentRects = [];
 
-  const rgbaAlpha = (rgba) => {
-    if (!rgba || !rgba.startsWith("rgba")) return 1;
-    const p = rgba.replace(/^rgba\(|\)$/g, "").split(",");
-    return parseFloat(p[3] || "1");
-  };
+  for (const el of allInFoldVisible) {
+    const rEl = el.getBoundingClientRect();
 
-  // Find a visible glyph at (x,y), not just a text node
-  const pointHasGlyph = (x, y) => {
-    const caretPos = (document.caretPositionFromPoint && document.caretPositionFromPoint(x, y)) ||
-                     (document.caretRangeFromPoint && document.caretRangeFromPoint(x, y));
-    if (!caretPos) return false;
-
-    const node = caretPos.offsetNode || caretPos.startContainer;
-    if (!node || node.nodeType !== Node.TEXT_NODE) return false;
-
-    const text = node.textContent || "";
-    if (!text.trim()) return false;
-
-    // pick nearest non-whitespace character around the offset
-    const base = caretPos.offset || caretPos.startOffset || 0;
-    const isNonWs = (ch) => !!ch && !/\s/.test(ch);
-    let idx = -1;
-    for (let d = 0; d <= 3; d++) {                // search ±3 chars
-      if (isNonWs(text[base + d])) { idx = base + d; break; }
-      if (isNonWs(text[base - d])) { idx = base - d; break; }
+    if (isMediaTag(el)) {
+      const inter = intersect(rEl);
+      if (inter) contentRects.push(inter);
+      continue;
     }
-    if (idx < 0) return false;
 
-    const range = document.createRange();
-    try {
-      range.setStart(node, Math.max(0, idx));
-      range.setEnd(node, Math.min(text.length, idx + 1));
-    } catch { return false; }
-
-    const rect = range.getBoundingClientRect();
-    if (!rect || rect.width === 0 || rect.height === 0) return false;
-
-    // ensure the point lies inside the actual glyph rect
-    if (x < rect.left || x > rect.right || y < rect.top || y > rect.bottom) return false;
-
-    // font visibility threshold
-    const el = document.elementFromPoint(x, y);
-    if (!el) return false;
     const st = getComputedStyle(el);
+    const text = (el.innerText || el.textContent || "").trim();
     const fs = parseFloat(st.fontSize || "0");
     const alpha = rgbaAlpha(st.color || "rgba(0,0,0,1)");
-    return fs >= 12 && alpha > 0.05;
-  };
 
-  const pointPaintsVisually = (x, y) => {
-    const el = document.elementFromPoint(x, y);
-    if (!el) return false;
-    if (!isVisible(el)) return false;
-
-    if (isMediaTag(el)) return true;
-    if (pointHasGlyph(x, y)) return true;
-
-    const st = getComputedStyle(el);
-    if (st.backgroundImage && st.backgroundImage !== "none") return true;
-
-    const bg = st.backgroundColor || "";
-    if (bg && bg !== "transparent") {
-      if (!bg.startsWith("rgba")) return true;
-      if (rgbaAlpha(bg) > 0.05) return true;
-    }
-    const hasBorder =
-      ["borderTopWidth","borderRightWidth","borderBottomWidth","borderLeftWidth"].some(k => parseFloat(st[k]) > 0) &&
-      ["borderTopColor","borderRightColor","borderBottomColor","borderLeftColor"].some(k => (st[k]||"") !== "transparent");
-    return hasBorder;
-  };
-
-  let contentHits = 0, paintedHits = 0;
-  for (let r = 0; r < ROWS; r++) {
-    for (let c = 0; c < COLS; c++) {
-      const x = (c + 0.5) * cellW;
-      const y = (r + 0.5) * cellH;
-      if (x < 0 || y < 0 || x >= vpW || y >= vpH) continue;
-
-      const el = document.elementFromPoint(x, y);
-      if (!el || !isVisible(el)) continue;
-
-      const isContent = isMediaTag(el) || pointHasGlyph(x, y);  // foreground only
-      const isPainted = pointPaintsVisually(x, y);               // includes backgrounds
-
-      if (isContent) contentHits++;
-      if (isPainted) paintedHits++;
+    if (text.length >= TEXT_LEN_MIN && fs >= FONT_MIN && alpha > 0.05) {
+      try {
+        const range = document.createRange();
+        range.selectNodeContents(el);
+        const rects = Array.from(range.getClientRects());
+        for (const rr of rects) {
+          const inter = intersect(rr);
+          if (!inter) continue;
+          // Ignore tiny fragments / line-height artifacts
+          if (inter.width < 2 || inter.height < fs * 0.4) continue;
+          contentRects.push(inter);
+        }
+      } catch {
+        // if selection fails (e.g., pseudo-element), skip
+      }
     }
   }
 
-  const totalCells = ROWS * COLS;
-  const foldCoveragePct     = Math.min(100, Math.round((contentHits / totalCells) * 100));
-  const paintedCoveragePct  = Math.min(100, Math.round((paintedHits / totalCells) * 100));
+  // Painted rects = content rects + elements that visually paint (bg image/color or border)
+  const paintedRects = [...contentRects];
+  for (const el of allInFoldVisible) {
+    if (isMediaTag(el)) continue; // already counted
+    const st = getComputedStyle(el);
+    let paints = false;
 
+    if (st.backgroundImage && st.backgroundImage !== "none") paints = true;
+    const bg = st.backgroundColor || "";
+    if (!paints && bg && bg !== "transparent") {
+      paints = !bg.startsWith("rgba") || rgbaAlpha(bg) > 0.05;
+    }
+    if (!paints) {
+      const hasBorder =
+        ["borderTopWidth","borderRightWidth","borderBottomWidth","borderLeftWidth"].some(k => parseFloat(st[k]) > 0) &&
+        ["borderTopColor","borderRightColor","borderBottomColor","borderLeftColor"].some(k => (st[k]||"") !== "transparent");
+      paints = hasBorder;
+    }
+
+    if (paints) {
+      const inter = intersect(el.getBoundingClientRect());
+      if (inter) paintedRects.push(inter);
+    }
+  }
+
+  // ========= Grid-union coverage from rect lists =========
+  const coverageFromRects = (rects) => {
+    const ROWS = 40, COLS = 24; // tune for speed/accuracy
+    const cellW = vpW / COLS, cellH = vpH / ROWS;
+    const covered = new Set();
+    for (const r of rects) {
+      const x0 = Math.max(0, Math.floor(r.left / cellW));
+      const x1 = Math.min(COLS - 1, Math.floor((r.right - 0.01) / cellW));
+      const y0 = Math.max(0, Math.floor(r.top / cellH));
+      const y1 = Math.min(ROWS - 1, Math.floor((r.bottom - 0.01) / cellH));
+      for (let y = y0; y <= y1; y++) for (let x = x0; x <= x1; x++) covered.add(y * COLS + x);
+    }
+    return Math.min(100, Math.round((covered.size / (ROWS * COLS)) * 100));
+  };
+
+  const foldCoveragePct    = coverageFromRects(contentRects);   // use for scoring
+  const paintedCoveragePct = coverageFromRects(paintedRects);   // debug/insight
+
+  // ========= Return payload =========
   return {
     firstCtaInFold,
-    foldCoveragePct,         // content-only (use for scoring)
-    paintedCoveragePct,      // including backgrounds (debug)
+    foldCoveragePct,
+    paintedCoveragePct,
     maxFontPx: maxFont || 0,
     minFontPx: Number.isFinite(minFont) ? minFont : 0,
     smallTapTargets,
