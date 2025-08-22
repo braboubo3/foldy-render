@@ -1,657 +1,746 @@
-/**
- * foldy-render — Express + Playwright microservice
- *
- * Endpoints
- *   GET  /health
- *   POST /render  (Authorization: Bearer <RENDER_TOKEN>)
- *     Body: { url, device, debugOverlay?, debugRects?, debugHeatmap? }
- *
- * Behavior
- *   - Loads page on a chosen mobile device preset.
- *   - Runs a pre-hide audit (detect overlays, visible coverage).
- *   - Hides overlays and re-audits on the clean view (this is what we score).
- *   - Returns a single CLEAN first-viewport screenshot.
- *   - Optional debug:
- *       • debugRects=1    → return raw rects and covered cells (JSON)
- *       • debugHeatmap=1  → return a heatmap PNG with counted areas highlighted
- */
+// Foldy — Render Service (stabilized)
+// One shared Chromium per process; 1 context per request.
+// API: POST /render -> { clean PNG + UX metrics + timings }, GET /health.
+// Auth: Bearer token (RENDER_TOKEN). SSRF guard: blocks non-http(s) & private ranges.
+// Debug flags: debugOverlay, debugRects, debugHeatmap (in body or query).
 
+/* eslint-disable no-console */
 import express from "express";
-import { chromium, devices } from "playwright";
+import { chromium } from "playwright";
+import dns from "node:dns/promises";
+import net from "node:net";
+import * as url from "node:url";
 
 const PORT = process.env.PORT || 3000;
-const AUTH = process.env.RENDER_TOKEN || "devtoken";
+const RENDER_TOKEN = process.env.RENDER_TOKEN;
+
+if (!RENDER_TOKEN) {
+  console.error("Missing RENDER_TOKEN");
+  process.exit(1);
+}
 
 const app = express();
-app.use(express.json({ limit: "8mb" }));
+app.use(express.json({ limit: "1mb" }));
 
-/* -------------------------------------------------------------------------- */
-/* Device presets (override viewport for exact fold)                          */
-/* -------------------------------------------------------------------------- */
-const DEVICE_MAP = {
-  iphone_se_2: {
-    label: "iPhone SE (2nd gen)",
-    vp: { width: 375, height: 667 },
-    profile: devices["iPhone SE"],
-  },
-  iphone_15_pro: {
-    label: "iPhone 15 Pro",
-    vp: { width: 393, height: 852 },
-    profile: devices["iPhone 13 Pro"], // close enough preset
-  },
-  iphone_15_pro_max: {
-    label: "iPhone 15 Pro Max",
-    vp: { width: 430, height: 932 },
-    profile: devices["iPhone 13 Pro Max"],
-  },
-  pixel_8: {
-    label: "Pixel 8",
-    vp: { width: 412, height: 915 },
-    profile: devices["Pixel 5"],
-  },
-  galaxy_s23: {
-    label: "Galaxy S23",
-    vp: { width: 360, height: 800 },
-    profile: devices["Galaxy S9+"],
-  },
-};
-
-/* --------------------------------- Auth ----------------------------------- */
-function requireAuth(req, res, next) {
-  const token = (req.headers.authorization || "").replace(/^Bearer\s+/i, "");
-  if (!token || token !== AUTH) return res.status(401).json({ error: "unauthorized" });
+/** ---------- Auth ---------- **/
+function authMiddleware(req, res, next) {
+  const hdr = req.headers.authorization || "";
+  const token = hdr.startsWith("Bearer ") ? hdr.slice(7) : "";
+  if (!token || token !== RENDER_TOKEN) {
+    return res.status(401).json({ ok: false, error: "Unauthorized" });
+  }
   next();
 }
 
-/* ------------------------------- SSRF guard --------------------------------
- * Allow only http/https and block obvious internal hosts (MVP guard).
- * -------------------------------------------------------------------------- */
-function isAllowedUrl(u) {
+/** ---------- SSRF Guard ---------- **/
+const PRIVATE_CIDRS = [
+  "127.0.0.0/8", // loopback
+  "10.0.0.0/8",
+  "172.16.0.0/12",
+  "192.168.0.0/16",
+  "0.0.0.0/8",
+  "169.254.0.0/16", // link-local
+];
+
+function ipInCidr(ip, cidr) {
+  const [range, bitsStr] = cidr.split("/");
+  const bits = parseInt(bitsStr, 10);
+  const ipBuf = net.isIP(ip) === 4 ? ipV4ToBuf(ip) : null;
+  const rangeBuf = ipV4ToBuf(range);
+  if (!ipBuf) return false;
+  const mask = ~((1 << (32 - bits)) - 1);
+  return (bufToInt(ipBuf) & mask) === (bufToInt(rangeBuf) & mask);
+}
+function ipV4ToBuf(ip) {
+  return Buffer.from(ip.split(".").map((n) => parseInt(n, 10)));
+}
+function bufToInt(b) {
+  return (b[0] << 24) | (b[1] << 16) | (b[2] << 8) | b[3];
+}
+async function assertUrlAllowed(raw) {
+  let u;
   try {
-    const { protocol, hostname } = new URL(u);
-    if (!/^https?:$/.test(protocol)) return false;
-    if (
-      hostname === "localhost" ||
-      hostname === "127.0.0.1" ||
-      /^10\./.test(hostname) ||
-      /^192\.168\./.test(hostname) ||
-      /^172\.(1[6-9]|2\d|3[0-1])\./.test(hostname)
-    ) return false;
-    return true;
+    u = new URL(raw);
   } catch {
-    return false;
+    throw Object.assign(new Error("Invalid URL"), { status: 400 });
   }
-}
-
-/* --------------------------- Shared Playwright ---------------------------- */
-let browser = null;
-async function getBrowser() {
-  if (browser && browser.isConnected()) return browser;
-  if (browser) try { await browser.close(); } catch {}
-  browser = await chromium.launch({
-    headless: true,
-    args: [
-      "--no-sandbox",
-      "--disable-setuid-sandbox",
-      "--disable-dev-shm-usage",
-      "--disable-background-timer-throttling",
-      "--disable-renderer-backgrounding",
-    ],
-  });
-  browser.on("disconnected", () => { browser = null; });
-  return browser;
-}
-
-/* --------------------------------- Health --------------------------------- */
-app.get("/health", async (_req, res) => {
-  try { await getBrowser(); res.json({ ok: true, up: true }); }
-  catch (e) { res.status(500).json({ ok: false, error: String(e) }); }
-});
-
-/* -------------------------- Overlay hider (Node) -------------------------- */
-async function hideOverlaysAndUnlock(page) {
-  await page.evaluate(() => {
-    // Hide anything our audit marked
-    document.querySelectorAll('[data-foldy-overlay="1"]').forEach((el) => {
-      el.setAttribute("data-foldy-overlay-hidden", "1");
-      el.style.setProperty("display", "none", "important");
-      el.style.setProperty("visibility", "hidden", "important");
-    });
-
-    // Extra heuristics for popular CMPs
-    const selectors = [
-      '[id*="cookie" i]','[class*="cookie" i]',
-      '[id*="consent" i]','[class*="consent" i]',
-      '[id*="gdpr" i]','[class*="gdpr" i]',
-      '[role="dialog"]',
-    ];
-    document.querySelectorAll(selectors.join(",")).forEach((el) => {
-      const st = getComputedStyle(el);
-      if (st.position === "fixed" || st.position === "sticky") {
-        el.setAttribute("data-foldy-overlay-hidden", "1");
-        el.style.setProperty("display", "none", "important");
-        el.style.setProperty("visibility", "hidden", "important");
-      }
-    });
-
-    // Unlock scroll if CMP locked it
-    document.documentElement.style.setProperty("overflow", "auto", "important");
-    document.body.style.setProperty("overflow", "auto", "important");
-    document.body.classList.remove("modal-open", "overflow-hidden", "disable-scroll");
-  });
-}
-
-/* -------------------------- Clean-fold re-audit --------------------------- */
-async function evalCleanFold(page) {
-  return page.evaluate(() => {
-    const vpW = window.innerWidth, vpH = window.innerHeight;
-    const inViewport = (r) => r.top < vpH && r.bottom > 0 && r.left < vpW && r.right > 0;
-    const isVisible = (el) => {
-      const st = getComputedStyle(el);
-      if (st.visibility === "hidden" || st.display === "none" || st.opacity === "0") return false;
-      const r = el.getBoundingClientRect(); return r.width > 0 && r.height > 0;
-    };
-    const intersect = (r) => {
-      const left = Math.max(0, r.left), top = Math.max(0, r.top);
-      const right = Math.min(vpW, r.right), bottom = Math.min(vpH, r.bottom);
-      const w = Math.max(0, right - left), h = Math.max(0, bottom - top);
-      return w > 0 && h > 0 ? { left, top, right, bottom, width: w, height: h } : null;
-    };
-    const rgbaAlpha = (rgba) => rgba?.startsWith("rgba") ? parseFloat(rgba.replace(/^rgba\(|\)$/g,"").split(",")[3]||"1") : 1;
-    const norm = (s) => (s||"").toLowerCase().normalize("NFD").replace(/[\u0300-\u036f]/g, "");
-    const getText = (el) => (el.innerText || el.textContent || "");
-    const getAria = (el) => (el.getAttribute("aria-label") || el.getAttribute("title") || "");
-    const isMedia = (el) => ["IMG","VIDEO","CANVAS","SVG"].includes(el.tagName);
-
-    const all = Array.from(document.querySelectorAll("body *"))
-      .filter((el) => isVisible(el) && inViewport(el.getBoundingClientRect()));
-
-    // Content rects: glyph text + media + large, non-repeating hero BGs
-    const TEXT_LEN_MIN = 3, FONT_MIN = 12;
-    const rects = [];
-
-    // media
-    for (const el of all) { if (isMedia(el)) { const i = intersect(el.getBoundingClientRect()); if (i) rects.push(i); } }
-
-    // glyph text
-    const acceptText = { acceptNode:n => (n.nodeType===Node.TEXT_NODE && (n.textContent||"").trim().length>=TEXT_LEN_MIN) ? NodeFilter.FILTER_ACCEPT : NodeFilter.FILTER_SKIP };
-    for (const root of all) {
-      const st = getComputedStyle(root); const fs = parseFloat(st.fontSize||"0"); const alpha = rgbaAlpha(st.color||"rgba(0,0,0,1)");
-      if (fs<FONT_MIN || alpha<=0.05) continue;
-      const tw = document.createTreeWalker(root, NodeFilter.SHOW_TEXT, acceptText);
-      let node; while ((node = tw.nextNode())) {
-        try {
-          const rng = document.createRange(); rng.selectNodeContents(node);
-          for (const rr of Array.from(rng.getClientRects())) {
-            const i = intersect(rr); if (!i) continue;
-            if (i.width<2 || i.height<fs*0.4) continue;
-            rects.push(i);
-          }
-        } catch {}
-      }
-    }
-
-    // Hero background images (large, no-repeat) treated as content
-    for (const el of all) {
-      if (el.tagName==="HTML"||el.tagName==="BODY") continue;
-      const st = getComputedStyle(el);
-      if (st.backgroundImage && st.backgroundImage!=="none" && (st.backgroundRepeat||"").includes("no-repeat")) {
-        const i = intersect(el.getBoundingClientRect());
-        if (i && (i.width*i.height) >= vpW*vpH*0.25) rects.push(i);
-      }
-    }
-
-    // Grid union
-    const ROWS=40, COLS=24, cellW=vpW/COLS, cellH=vpH/ROWS;
-    const cells=new Set();
-    for (const r of rects) {
-      const x0=Math.max(0,Math.floor(r.left/cellW)), x1=Math.min(COLS-1,Math.floor((r.right-0.01)/cellW));
-      const y0=Math.max(0,Math.floor(r.top/cellH)),  y1=Math.min(ROWS-1,Math.floor((r.bottom-0.01)/cellH));
-      for (let y=y0;y<=y1;y++) for (let x=x0;x<=x1;x++) cells.add(y*COLS+x);
-    }
-    const foldCoveragePct = Math.min(100, Math.round((cells.size/(ROWS*COLS))*100));
-
-    // CTA detection (i18n, accent-insensitive) on clean view
-    const CTA_RE = new RegExp([
-      "buy","add to cart","add-to-cart","shop now","sign up","signup","get started","start now","try","free trial",
-      "subscribe","join","book","order","checkout","continue","download","contact","learn more","demo","request demo",
-      "essayer","essai gratuit","demarrer","demarrer maintenant","sinscrire","inscrivez","demander une demo","acheter",
-      "ajouter au panier","commander","souscrire",
-      "jetzt kaufen","in den warenkorb","jetzt starten","kostenlos testen","mehr erfahren","anmelden","registrieren",
-      "comprar","agregar al carrito","empieza","prueba gratis","solicitar demo","suscribete","contacto",
-      "comprar","adicionar ao carrinho","iniciar","teste gratis","solicitar demo","assine","contato",
-      "compra","aggiungi al carrello","inizia ora","prova gratis","richiedi demo","iscriviti","contattaci"
-    ].join("|"), "i");
-    const actionable = Array.from(document.querySelectorAll('a,button,[role="button"],input[type="submit"],input[type="button"]'))
-      .filter((el)=> isVisible(el) && !el.disabled && getComputedStyle(el).cursor!=="default");
-    const firstCtaInFold = actionable.some((el)=>{
-      const label = norm(getText(el) || getAria(el) || el.value || "");
-      return CTA_RE.test(label) && inViewport(el.getBoundingClientRect());
-    });
-
-    return { foldCoveragePct, firstCtaInFold };
-  });
-}
-
-/* ---------------------------- Heatmap (debug) ----------------------------- */
-async function drawAndSnapHeatmap(page, opts = { rows: 40, cols: 24 }) {
-  const meta = await page.evaluate((grid) => {
-    const vpW = innerWidth, vpH = innerHeight;
-    const isVisible = (el) => {
-      const st = getComputedStyle(el);
-      if (st.visibility==="hidden"||st.display==="none"||st.opacity==="0") return false;
-      const r=el.getBoundingClientRect(); return r.width>0&&r.height>0;
-    };
-    const intersect = (r) => {
-      const L=Math.max(0,r.left), T=Math.max(0,r.top), R=Math.min(vpW,r.right), B=Math.min(vpH,r.bottom);
-      const W=Math.max(0,R-L), H=Math.max(0,B-T); return W>0&&H>0?{left:L,top:T,width:W,height:H}:null;
-    };
-    const rgbaAlpha = (rgba) => rgba?.startsWith("rgba") ? parseFloat(rgba.replace(/^rgba\(|\)$/g,"").split(",")[3]||"1") : 1;
-    const isMedia = (el) => ["IMG","VIDEO","CANVAS","SVG"].includes(el.tagName);
-    const all = Array.from(document.querySelectorAll("body *")).filter(isVisible);
-
-    const glyphRects=[], mediaRects=[], heroBgRects=[];
-    for (const el of all) { if (isMedia(el)) { const i=intersect(el.getBoundingClientRect()); if (i) mediaRects.push(i); } }
-    const TEXT_LEN_MIN=3, FONT_MIN=12;
-    const acceptText={acceptNode:n=>(n.nodeType===Node.TEXT_NODE&&(n.textContent||"").trim().length>=TEXT_LEN_MIN)?NodeFilter.FILTER_ACCEPT:NodeFilter.FILTER_SKIP};
-    for (const root of all) {
-      const st=getComputedStyle(root); const fs=parseFloat(st.fontSize||"0"); const alpha=rgbaAlpha(st.color||"rgba(0,0,0,1)");
-      if (fs<FONT_MIN||alpha<=0.05) continue;
-      const tw=document.createTreeWalker(root, NodeFilter.SHOW_TEXT, acceptText);
-      let node; while((node=tw.nextNode())){
-        try {
-          const rng=document.createRange(); rng.selectNodeContents(node);
-          for (const rr of Array.from(rng.getClientRects())) {
-            const i=intersect(rr); if(!i) continue;
-            if (i.width<2||i.height<fs*0.4) continue;
-            glyphRects.push(i);
-          }
-        } catch{}
-      }
-    }
-    for (const el of all) {
-      if (el.tagName==="HTML"||el.tagName==="BODY") continue;
-      const st=getComputedStyle(el);
-      if (st.backgroundImage && st.backgroundImage!=="none" && (st.backgroundRepeat||"").includes("no-repeat")) {
-        const i=intersect(el.getBoundingClientRect());
-        if (i && (i.width*i.height) >= vpW*vpH*0.25) heroBgRects.push(i);
-      }
-    }
-
-    // Draw overlay
-    const root=document.createElement("div"); root.id="__foldy_debug";
-    root.style.cssText=`position:fixed;inset:0;pointer-events:none;z-index:2147483647;
-      background: repeating-linear-gradient(0deg,transparent,transparent ${vpH/grid.rows}px,rgba(255,255,255,.04) ${vpH/grid.rows}px,rgba(255,255,255,.04) ${2*vpH/grid.rows}px),
-                  repeating-linear-gradient(90deg,transparent,transparent ${vpW/grid.cols}px,rgba(255,255,255,.04) ${vpW/grid.cols}px,rgba(255,255,255,.04) ${2*vpW/grid.cols}px);`;
-    document.documentElement.appendChild(root);
-    const paint=(rects,color)=>{ for (const r of rects){ const d=document.createElement("div");
-      d.style.cssText=`position:absolute;left:${r.left}px;top:${r.top}px;width:${r.width}px;height:${r.height}px;background:${color};`; root.appendChild(d);} };
-    paint(glyphRects,"rgba(50,200,90,.35)");
-    paint(mediaRects,"rgba(50,120,220,.35)");
-    paint(heroBgRects,"rgba(200,160,60,.28)");
-
-    return {
-      glyphRects: glyphRects.map(r=>[r.left,r.top,r.width,r.height]),
-      mediaRects: mediaRects.map(r=>[r.left,r.top,r.width,r.height]),
-      heroBgRects: heroBgRects.map(r=>[r.left,r.top,r.width,r.height]),
-      rows: grid.rows, cols: grid.cols
-    };
-  }, opts);
-
-  const png = await page.screenshot({ type: "png", fullPage: false, clip: { x: 0, y: 0, width: page.viewportSize().width, height: page.viewportSize().height } });
-  await page.evaluate(() => { document.getElementById("__foldy_debug")?.remove(); });
-  return { pngDebugBase64: png.toString("base64"), debugMeta: meta };
-}
-
-/* --------------------------------- /render -------------------------------- */
-app.post("/render", requireAuth, async (req, res) => {
-  const { url, device } = req.body || {};
-  const debugOverlay  = req.query.debugOverlay === "1" || req.body?.debugOverlay === true;
-  const debugRects    = req.query.debugRects === "1"   || req.body?.debugRects === true;
-  const debugHeatmap  = req.query.debugHeatmap === "1" || req.body?.debugHeatmap === true;
-
-  if (!url || !device || !DEVICE_MAP[device] || !isAllowedUrl(url)) {
-    return res.status(400).json({ error: "bad input" });
+  if (!["http:", "https:"].includes(u.protocol)) {
+    throw Object.assign(new Error("Only http/https allowed"), { status: 422 });
+  }
+  const hostLower = (u.hostname || "").toLowerCase();
+  if (
+    hostLower === "localhost" ||
+    hostLower === "127.0.0.1" ||
+    hostLower === "::1"
+  ) {
+    throw Object.assign(new Error("Localhost blocked"), { status: 422 });
   }
 
-  const start = Date.now();
-  let context = null;
-
+  // Resolve A/AAAA and block private ranges. (We only handle IPv4 here; IPv6 localhost already blocked.)
+  let addrs = [];
   try {
-    const b = await getBrowser();
-    const conf = DEVICE_MAP[device];
-
-    context = await b.newContext({ ...conf.profile, viewport: conf.vp });
-    const page = await context.newPage();
-    page.setDefaultNavigationTimeout(15000);
-    page.setDefaultTimeout(15000);
-
-    // Trim trackers/heavy media to stabilize load
-    await page.route("**/*", (route) => {
-      const u = route.request().url();
-      if (/\.(mp4|mov|avi|m4v|webm)$/i.test(u) ||
-          /(hotjar|fullstory|segment|google-analytics|gtm|optimizely|clarity|doubleclick)/i.test(u)) {
-        return route.abort();
+    const a = await dns.resolve4(u.hostname, { ttl: false });
+    addrs = a;
+  } catch (e) {
+    // If resolve4 fails, still allow navigation; Playwright will attempt. But we block obvious local names earlier.
+    addrs = [];
+  }
+  for (const ip of addrs) {
+    for (const cidr of PRIVATE_CIDRS) {
+      if (ipInCidr(ip, cidr)) {
+        throw Object.assign(new Error("Private network blocked"), {
+          status: 422,
+        });
       }
-      return route.continue();
+    }
+  }
+  return u.toString();
+}
+
+/** ---------- Devices (MVP) ---------- **/
+// Specified in docs with explicit viewports & DPRs
+// iphone_15_pro (393×852), iphone_15_pro_max (430×932), pixel_8 (412×915), galaxy_s23 (360×800), iphone_se_2 (375×667)
+const DEVICES = {
+  iphone_15_pro: {
+    label: "iPhone 15 Pro",
+    viewport: { width: 393, height: 852 },
+    dpr: 3,
+    ua: "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1",
+    mobile: true,
+  },
+  iphone_15_pro_max: {
+    label: "iPhone 15 Pro Max",
+    viewport: { width: 430, height: 932 },
+    dpr: 3,
+    ua: "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1",
+    mobile: true,
+  },
+  pixel_8: {
+    label: "Pixel 8",
+    viewport: { width: 412, height: 915 },
+    dpr: 2.625,
+    ua: "Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Mobile Safari/537.36",
+    mobile: true,
+  },
+  galaxy_s23: {
+    label: "Galaxy S23",
+    viewport: { width: 360, height: 800 },
+    dpr: 3,
+    ua: "Mozilla/5.0 (Linux; Android 14; SM-S911B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Mobile Safari/537.36",
+    mobile: true,
+  },
+  iphone_se_2: {
+    label: "iPhone SE (2nd gen)",
+    viewport: { width: 375, height: 667 },
+    dpr: 2,
+    ua: "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1",
+    mobile: true,
+  },
+};
+
+function deviceFromKey(key) {
+  const d = DEVICES[key];
+  if (!d) return null;
+  const contextOpts = {
+    viewport: d.viewport,
+    deviceScaleFactor: d.dpr,
+    isMobile: !!d.mobile,
+    hasTouch: true,
+    userAgent: d.ua,
+    locale: "en-US",
+  };
+  return { key, label: d.label, contextOpts };
+}
+
+/** ---------- Shared browser ---------- **/
+let browserPromise = null;
+async function getBrowser() {
+  if (!browserPromise) {
+    browserPromise = chromium.launch({
+      headless: true,
+      args: [
+        "--disable-dev-shm-usage",
+        "--no-sandbox",
+        "--disable-gpu",
+        "--no-default-browser-check",
+      ],
     });
+  }
+  return browserPromise;
+}
 
-    // Navigate
-    const tNav0 = Date.now();
-    await page.goto(url, { waitUntil: "networkidle" });
-    const nav_ms = Date.now() - tNav0;
+/** ---------- Helpers: timing ---------- **/
+const now = () => Date.now();
+function ms(start, end) {
+  return Math.max(0, Math.round(end - start));
+}
 
-    // Disable animations (faster/more deterministic screenshots)
-    await page.addStyleTag({ content: `
-      *,*::before,*::after{animation:none!important;transition:none!important}
-      html{scroll-behavior:auto!important}
-    `});
+/** ---------- Page setup: network hygiene & animation kill ---------- **/
+const ABORT_PATTERNS = [
+  // analytics/ads
+  "googletagmanager.com",
+  "google-analytics.com",
+  "doubleclick.net",
+  "facebook.net",
+  "hotjar.com",
+  "fullstory.com",
+  "segment.io",
+  "mixpanel.com",
+  "amplitude.com",
+  "newrelic.com",
+  "clarity.ms",
+  // heavy media
+  ".mp4",
+  ".m3u8",
+  ".webm",
+  ".mov",
+  "youtube.com",
+  "vimeo.com",
+  "player.vimeo.com",
+];
 
-    const tSettle0 = Date.now();
-    await page.waitForTimeout(800);
-    const settle_ms = Date.now() - tSettle0;
+async function prepPage(page) {
+  // Abort trackers & big media
+  await page.route("**/*", (route) => {
+    const url = route.request().url().toLowerCase();
+    const shouldAbort = ABORT_PATTERNS.some((p) => url.includes(p));
+    if (shouldAbort) return route.abort();
+    return route.continue();
+  });
 
-    /* --------------------------- Pre-hide audit ---------------------------- */
-    const tAudit0 = Date.now();
-    const ux = await page.evaluate((opts) => {
-      const vpW = window.innerWidth, vpH = window.innerHeight;
+  await page.addInitScript(() => {
+    try {
+      // Reduce animations/transitions for stability
+      const s = document.createElement("style");
+      s.id = "_foldy_anim_off";
+      s.textContent = `
+        * { animation: none !important; transition: none !important; }
+        html, body { scroll-behavior: auto !important; }
+      `;
+      document.documentElement.appendChild(s);
+    } catch { /* noop */ }
+  });
 
-      const inViewport = (r) => r.top < vpH && r.bottom > 0 && r.left < vpW && r.right > 0;
-      const isVisible = (el) => {
-        const st = getComputedStyle(el);
-        if (st.visibility==="hidden"||st.display==="none"||st.opacity==="0") return false;
-        const r = el.getBoundingClientRect(); return r.width>0 && r.height>0;
-      };
-      const intersect = (r) => {
-        const L=Math.max(0,r.left), T=Math.max(0,r.top), R=Math.min(vpW,r.right), B=Math.min(vpH,r.bottom);
-        const W=Math.max(0,R-L), H=Math.max(0,B-T); return W>0&&H>0?{left:L,top:T,right:R,bottom:B,width:W,height:H}:null;
-      };
-      const rgbaAlpha = (rgba) => rgba?.startsWith("rgba") ? parseFloat(rgba.replace(/^rgba\(|\)$/g,"").split(",")[3]||"1") : 1;
-      const norm = (s) => (s||"").toLowerCase().normalize("NFD").replace(/[\u0300-\u036f]/g,"");
-      const getText=(el)=>(el.innerText||el.textContent||"");
-      const getAria=(el)=>(el.getAttribute("aria-label")||el.getAttribute("title")||"");
-      const isMedia=(el)=>["IMG","VIDEO","CANVAS","SVG"].includes(el.tagName);
+  page.setDefaultTimeout(15000);
+  page.setDefaultNavigationTimeout(15000);
+}
 
-      // CTA (i18n)
-      const CTA_RE = new RegExp([
-        "buy","add to cart","add-to-cart","shop now","sign up","signup","get started","start now","try","free trial",
-        "subscribe","join","book","order","checkout","continue","download","contact","learn more","demo","request demo",
-        "essayer","essai gratuit","demarrer","demarrer maintenant","sinscrire","inscrivez","demander une demo","acheter",
-        "ajouter au panier","commander","souscrire",
-        "jetzt kaufen","in den warenkorb","jetzt starten","kostenlos testen","mehr erfahren","anmelden","registrieren",
-        "comprar","agregar al carrito","empieza","prueba gratis","solicitar demo","suscribete","contacto",
-        "comprar","adicionar ao carrinho","iniciar","teste gratis","solicitar demo","assine","contato",
-        "compra","aggiungi al carrello","inizia ora","prova gratis","richiedi demo","iscriviti","contattaci"
-      ].join("|"), "i");
+/** ---------- In-page auditing code ---------- **/
+const PAGE_EVAL = {
+  // Return as-seen screenshot PNG (called before hiding overlays when debugOverlay=1)
+  async asSeen(page) {
+    return page.screenshot({ type: "png", fullPage: false });
+  },
 
-      const actionable = Array.from(document.querySelectorAll('a,button,[role="button"],input[type="submit"],input[type="button"]'))
-        .filter((el)=> isVisible(el) && !el.disabled && getComputedStyle(el).cursor!=="default");
+  // Scan overlays before hide; identify candidates and compute stats in fold.
+  async preHideOverlays(page) {
+    return page.evaluate(() => {
+      const vw = window.innerWidth;
+      const vh = window.innerHeight;
+      const foldArea = vw * vh;
 
-      const firstCtaInFold = actionable.some((el)=>{
-        const label = norm(getText(el) || getAria(el) || el.value || "");
-        return CTA_RE.test(label) && inViewport(el.getBoundingClientRect());
-      });
-
-      // Visible elements in fold
-      const all = Array.from(document.querySelectorAll("body *"))
-        .filter((el)=> isVisible(el) && inViewport(el.getBoundingClientRect()));
-
-      // Typography bounds
-      let maxFontPx=0, minFontPx=Infinity;
-      for (const el of all) {
-        const fs = parseFloat(getComputedStyle(el).fontSize||"0");
-        if (fs>0) { if (fs>maxFontPx) maxFontPx=fs; if (fs<minFontPx) minFontPx=fs; }
-      }
-      if (!Number.isFinite(minFontPx)) minFontPx = 0;
-
-      // Small tap targets (basic)
-      const hasLabel = (el) => {
-        const t=(el.innerText||el.textContent||"").trim();
-        const a=(el.getAttribute("aria-label")||el.title||"").trim();
-        return (t.length + a.length) > 0;
-      };
-      const isLikelyChatWidget = (el) => {
-        const idc=(el.id+" "+el.className).toLowerCase();
-        if (/(intercom|crisp|drift|tawk|livechat|hubspot-messages|zendesk|olark)/.test(idc)) return true;
-        const st=getComputedStyle(el); const r=el.getBoundingClientRect();
-        const anchoredBR = st.position==="fixed" && (vpW - r.right < 120) && (vpH - r.bottom < 120);
-        return anchoredBR && r.width<=64 && r.height<=64;
-      };
-      const smallTapTargets = actionable.filter((el) => {
-        if (isLikelyChatWidget(el)) return false;
-        const r = el.getBoundingClientRect(); const area = r.width*r.height;
-        return inViewport(r) && hasLabel(el) && (r.width<44 || r.height<44) && area>300;
-      }).length;
-
-      const hasViewportMeta = !!document.querySelector('meta[name="viewport"]');
-
-      // Overlay detection (stricter; avoid headers/navs)
-      const isLikelyHeader = (el, r) => {
-        if (el.closest("header,[role='banner'],nav,[role='navigation']")) return true;
-        const nearTop = r.top <= 0 && r.height <= vpH * 0.35;
-        const fullWidth = r.width >= vpW * 0.9;
-        const hint = /(cookie|consent|gdpr|privacy|cmp)/i.test((el.id+" "+el.className+" "+(el.getAttribute("role")||"")+" "+(el.getAttribute("aria-label")||"")));
-        return nearTop && fullWidth && !hint;
-      };
-
-      const overlayCandidates = Array.from(document.querySelectorAll("body *")).filter((el)=>{
-        if (!isVisible(el)) return false;
-        const st=getComputedStyle(el);
-        if (!["fixed","sticky"].includes(st.position)) return false;
-        const r=el.getBoundingClientRect(); if (!inViewport(r)) return false;
-        if (isLikelyHeader(el, r)) return false;
-
-        const inter=intersect(r); if (!inter) return false;
-        const areaPct = (inter.width*inter.height)/(vpW*vpH);
-        const z = parseInt(st.zIndex||"0",10) || 0;
-
-        const cookieHint = /(cookie|consent|gdpr|privacy|cmp)/i.test((el.id+" "+el.className+" "+(el.getAttribute("role")||"")+" "+(el.getAttribute("aria-label")||"")));
-        const isDialog = el.getAttribute("role")==="dialog" || el.getAttribute("aria-modal")==="true";
-        const wideBar = inter.width >= vpW*0.9 && r.height >= 64;
-        const nearBottom = r.bottom >= vpH - Math.min(200, vpH*0.3);
-        const hasConsentButtons = /(accept|allow|agree|deny|reject|save|preferences|settings)/i.test((el.innerText||""))
-                                  && el.querySelectorAll("button,a,[role='button']").length >= 2;
-
-        if (cookieHint || isDialog) return true;
-        if (nearBottom && wideBar && hasConsentButtons) return true;
-        if (areaPct >= 0.30 && z >= 300) return true;  // huge cover
-        if (areaPct >= 0.15 && z >= 500) return true;  // sizable, very high z
-
-        return false;
-      });
-      overlayCandidates.forEach((el)=> el.setAttribute("data-foldy-overlay","1"));
-      const overlayRects = overlayCandidates.map((el)=> intersect(el.getBoundingClientRect())).filter(Boolean);
-      const overlayBlockers = overlayCandidates.filter((el)=>{
-        const r=el.getBoundingClientRect(); const i=intersect(r);
-        const areaPct = i ? (i.width*i.height)/(vpW*vpH) : 0;
-        const topCover = r.top<=0 && r.height>=vpH*0.25;
-        return areaPct>=0.30 || topCover;
-      }).length;
-
-      // Content rects: glyph text + media + large hero BGs
-      const TEXT_LEN_MIN=3, FONT_MIN=12;
-      const contentRects=[]; const glyphRects=[]; const mediaRects=[]; const heroBgRects=[];
-
-      // media
-      for (const el of all) {
-        if (!isMedia(el)) continue;
-        const i=intersect(el.getBoundingClientRect()); if (i) { contentRects.push(i); mediaRects.push(i); }
+      function isVisible(el) {
+        const r = el.getBoundingClientRect();
+        const style = getComputedStyle(el);
+        if (style.visibility === "hidden" || style.display === "none" || style.opacity === "0") return false;
+        if (r.width <= 0 || r.height <= 0) return false;
+        return r.top < vh && r.left < vw && r.bottom > 0 && r.right > 0;
       }
 
-      // glyph text
-      const acceptText={acceptNode:n=>(n.nodeType===Node.TEXT_NODE&&(n.textContent||"").trim().length>=TEXT_LEN_MIN)?NodeFilter.FILTER_ACCEPT:NodeFilter.FILTER_SKIP};
-      for (const root of all) {
-        const st=getComputedStyle(root); const fs=parseFloat(st.fontSize||"0"); const alpha=rgbaAlpha(st.color||"rgba(0,0,0,1)");
-        if (fs<FONT_MIN || alpha<=0.05) continue;
-        const tw=document.createTreeWalker(root, NodeFilter.SHOW_TEXT, acceptText);
-        let node; while((node=tw.nextNode())){
-          try {
-            const rng=document.createRange(); rng.selectNodeContents(node);
-            for (const rr of Array.from(rng.getClientRects())) {
-              const i=intersect(rr); if (!i) continue;
-              if (i.width<2 || i.height<fs*0.4) continue;
-              contentRects.push(i); glyphRects.push(i);
-            }
-          } catch {}
-        }
-      }
+      // Heuristics: fixed/sticky, large coverage, cookie keywords/buttons
+      const candidates = Array.from(document.querySelectorAll("*"))
+        .filter((el) => {
+          const style = getComputedStyle(el);
+          const pos = style.position;
+          if (!(pos === "fixed" || pos === "sticky")) return false;
+          if (!isVisible(el)) return false;
+          const r = el.getBoundingClientRect();
+          const inFoldWidth = Math.max(0, Math.min(r.right, vw) - Math.max(r.left, 0));
+          const inFoldHeight = Math.max(0, Math.min(r.bottom, vh) - Math.max(r.top, 0));
+          const inFoldArea = inFoldWidth * inFoldHeight;
+          // Big panels or bars
+          if (inFoldArea / foldArea < 0.12 && !(r.height > 48 && r.top > vh - 200)) return false;
 
-      // large non-repeating hero BGs as content (conversion-relevant)
-      for (const el of all) {
-        if (el.tagName==="HTML"||el.tagName==="BODY") continue;
-        const st=getComputedStyle(el);
-        if (st.backgroundImage && st.backgroundImage!=="none" && (st.backgroundRepeat||"").includes("no-repeat")) {
-          const i=intersect(el.getBoundingClientRect());
-          if (i) {
-            const areaPct=(i.width*i.height)/(vpW*vpH);
-            if (areaPct>=0.25 && !el.closest('[data-foldy-overlay="1"]')) { contentRects.push(i); heroBgRects.push(i); }
+          const txt = (el.innerText || "").toLowerCase();
+          const looksLikeCookie =
+            txt.includes("cookie") || txt.includes("consent") ||
+            txt.includes("accept all") || txt.includes("agree");
+          const likelyBar = r.height >= 48 && r.top >= vh - 220;
+          return looksLikeCookie || likelyBar || inFoldArea / foldArea >= 0.25;
+        });
+
+      const overlayRects = candidates.map((el) => {
+        const r = el.getBoundingClientRect();
+        const x = Math.max(0, r.left);
+        const y = Math.max(0, r.top);
+        const w = Math.min(vw, r.right) - x;
+        const h = Math.min(vh, r.bottom) - y;
+        return [Math.max(0, Math.round(x)), Math.max(0, Math.round(y)), Math.max(0, Math.round(w)), Math.max(0, Math.round(h))];
+      }).filter((r) => r[2] > 0 && r[3] > 0);
+
+      // Merge overlap area for coverage
+      function rectArea([, , w, h]) { return w * h; }
+      const overlayArea = overlayRects.reduce((a, r) => a + rectArea(r), 0); // double-count overlaps; good enough for penalty roughness
+
+      return {
+        overlayRects,
+        overlayElemsMarked: candidates.length,
+        overlayCoveragePct: Math.min(100, Math.round((overlayArea / foldArea) * 100)),
+        overlayBlockers: candidates.length > 0 ? 1 : 0 // "blockers" is a count of blocking entities; keep 1+ to trigger penalty
+      };
+    });
+  },
+
+  // Hide overlays in-place
+  async hideOverlays(page, overlayRects) {
+    await page.addStyleTag({
+      content: `
+        /* Hide selected overlays (best-effort) */
+        [data-foldy-overlay-hide="1"] { display: none !important; }
+      `,
+    });
+    await page.evaluate((rects) => {
+      const vh = window.innerHeight;
+      function tag(el) {
+        el.setAttribute("data-foldy-overlay-hide", "1");
+      }
+      const elems = Array.from(document.querySelectorAll("*"));
+      for (const el of elems) {
+        const r = el.getBoundingClientRect();
+        for (const [x, y, w, h] of rects) {
+          // If element intersects with any overlay rect within the fold, hide it.
+          const inter =
+            Math.max(0, Math.min(r.right, x + w) - Math.max(r.left, x)) *
+            Math.max(0, Math.min(r.bottom, y + h) - Math.max(r.top, y));
+          if (inter > 0 && r.top < vh && r.bottom > 0) {
+            tag(el);
+            break;
           }
         }
       }
+    }, overlayRects || []);
+  },
 
-      // painted (debug/insight)
-      const paintedRects=[...contentRects];
-      for (const el of all) {
-        if (["IMG","VIDEO","CANVAS","SVG"].includes(el.tagName)) continue;
-        const st=getComputedStyle(el); let paints=false;
-        if (st.backgroundImage && st.backgroundImage!=="none") paints=true;
-        const bg=st.backgroundColor||"";
-        if (!paints && bg && bg!=="transparent") paints=!bg.startsWith("rgba")||rgbaAlpha(bg)>0.05;
-        if (!paints) {
-          const hasBorder=
-            ["borderTopWidth","borderRightWidth","borderBottomWidth","borderLeftWidth"].some(k=>parseFloat(st[k])>0) &&
-            ["borderTopColor","borderRightColor","borderBottomColor","borderLeftColor"].some(k=>(st[k]||"")!=="transparent");
-          paints=hasBorder;
-        }
-        if (paints) { const i=intersect(el.getBoundingClientRect()); if (i) paintedRects.push(i); }
+  // Compute fold coverage + CTA/font/tap-target metrics on CLEAN view
+  async cleanAudit(page) {
+    return page.evaluate(() => {
+      const vw = window.innerWidth;
+      const vh = window.innerHeight;
+      const foldArea = vw * vh;
+
+      const GRID_ROWS = 24;
+      const GRID_COLS = 40;
+      const cellW = vw / GRID_COLS;
+      const cellH = vh / GRID_ROWS;
+
+      function clamp(n, lo, hi) { return Math.max(lo, Math.min(hi, n)); }
+      function isVisible(el) {
+        const style = getComputedStyle(el);
+        if (style.visibility === "hidden" || style.display === "none" || style.opacity === "0") return false;
+        const r = el.getBoundingClientRect();
+        if (r.width <= 0 || r.height <= 0) return false;
+        if (r.bottom <= 0 || r.right <= 0 || r.top >= vh || r.left >= vw) return false;
+        return true;
       }
 
-      // grid union
-      const ROWS=40, COLS=24, cellW=vpW/COLS, cellH=vpH/ROWS;
-      const toCells=(rects)=>{ const set=new Set();
-        for (const r of rects) {
-          const x0=Math.max(0,Math.floor(r.left/cellW)), x1=Math.min(COLS-1,Math.floor((r.right-0.01)/cellW));
-          const y0=Math.max(0,Math.floor(r.top/cellH)), y1=Math.min(ROWS-1,Math.floor((r.bottom-0.01)/cellH));
-          for (let y=y0;y<=y1;y++) for (let x=x0;x<=x1;x++) set.add(y*COLS+x);
-        } return set; };
-      const pct=(set)=> Math.min(100, Math.round((set.size/(ROWS*COLS))*100));
+      function rectsForTextNodes() {
+        const rects = [];
+        const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT, {
+          acceptNode: (n) => {
+            if (!n.nodeValue || !n.nodeValue.trim()) return NodeFilter.FILTER_REJECT;
+            const el = n.parentElement;
+            if (!el) return NodeFilter.FILTER_REJECT;
+            if (!isVisible(el)) return NodeFilter.FILTER_REJECT;
+            const style = getComputedStyle(el);
+            // Ignore extremely small or script-like text
+            const fontPx = parseFloat(style.fontSize || "0");
+            if (fontPx < 8) return NodeFilter.FILTER_REJECT;
+            return NodeFilter.FILTER_ACCEPT;
+          }
+        });
+        let node;
+        while ((node = walker.nextNode())) {
+          const range = document.createRange();
+          try {
+            range.selectNodeContents(node);
+            const r = range.getBoundingClientRect();
+            if (r && r.width > 0 && r.height > 0 && r.top < vh && r.left < vw && r.bottom > 0 && r.right > 0) {
+              const x = clamp(r.left, 0, vw), y = clamp(r.top, 0, vh);
+              const w = clamp(r.right, 0, vw) - x, h = clamp(r.bottom, 0, vh) - y;
+              if (w > 0 && h > 0) rects.push([x, y, w, h]);
+            }
+          } catch { /* skip */ }
+          range.detach?.();
+        }
+        return rects;
+      }
 
-      const contentCells=toCells(contentRects);
-      const paintedCells=toCells(paintedRects);
-      const overlayCells=toCells(overlayRects);
+      function rectsForMedia() {
+        const sels = "img,video,svg,canvas";
+        const rects = [];
+        document.querySelectorAll(sels).forEach((el) => {
+          if (!isVisible(el)) return;
+          const r = el.getBoundingClientRect();
+          const x = clamp(r.left, 0, vw), y = clamp(r.top, 0, vh);
+          const w = clamp(r.right, 0, vw) - x, h = clamp(r.bottom, 0, vh) - y;
+          if (w > 0 && h > 0) rects.push([x, y, w, h]);
+        });
+        return rects;
+      }
 
-      const visibleFoldCoveragePct = pct(contentCells);
-      const overlayCoveragePct     = pct(overlayCells);
+      function rectsForHeroBackgrounds() {
+        const rects = [];
+        const els = Array.from(document.querySelectorAll("body *"));
+        els.forEach((el) => {
+          if (!isVisible(el)) return;
+          const cs = getComputedStyle(el);
+          const bg = cs.backgroundImage;
+          if (!bg || bg === "none") return;
+          const repeat = cs.backgroundRepeat || "";
+          const size = cs.backgroundSize || "";
+          // Non-repeating, large-ish background (often hero)
+          const nonRepeating = repeat.includes("no-repeat");
+          const large = size.includes("cover") || size.includes("contain");
+          if (!nonRepeating && !large) return;
+          const r = el.getBoundingClientRect();
+          const x = clamp(r.left, 0, vw), y = clamp(r.top, 0, vh);
+          const w = clamp(r.right, 0, vw) - x, h = clamp(r.bottom, 0, vh) - y;
+          const area = w * h;
+          if (area / (vw * vh) >= 0.25) rects.push([x, y, w, h]);
+        });
+        return rects;
+      }
 
-      // Build debug (optional)
-      let debug = undefined;
-      if (opts && opts.wantRects) {
-        debug = {
-          rows: ROWS, cols: COLS,
-          glyphRects: glyphRects.map(r=>[r.left,r.top,r.width,r.height]),
-          mediaRects: mediaRects.map(r=>[r.left,r.top,r.width,r.height]),
-          heroBgRects: heroBgRects.map(r=>[r.left,r.top,r.width,r.height]),
-          overlayRects: overlayRects.map(r=>[r.left,r.top,r.width,r.height]),
-          coveredCells: Array.from(contentCells),
-          overlayCells: Array.from(overlayCells),
+      function rasterizeToGrid(rects) {
+        const covered = new Set();
+        rects.forEach(([x, y, w, h]) => {
+          const x0 = Math.floor(x / cellW);
+          const y0 = Math.floor(y / cellH);
+          const x1 = Math.ceil((x + w) / cellW);
+          const y1 = Math.ceil((y + h) / cellH);
+          for (let gy = Math.max(0, y0); gy < Math.min(GRID_ROWS, y1); gy++) {
+            for (let gx = Math.max(0, x0); gx < Math.min(GRID_COLS, x1); gx++) {
+              covered.add(gy * GRID_COLS + gx);
+            }
+          }
+        });
+        return Array.from(covered.values()).sort((a, b) => a - b);
+      }
+
+      function ctaDetection() {
+        const PHRASES = [
+          // EN
+          "get started","start now","buy","add to cart","book","sign up","log in","subscribe","try","contact","learn more",
+          // FR
+          "commencer","acheter","ajouter au panier","réserver","s'inscrire","se connecter","essayer","nous contacter","en savoir plus",
+          // DE
+          "jetzt starten","kaufen","in den warenkorb","buchen","registrieren","anmelden","testen","kontakt","mehr erfahren",
+          // ES
+          "empezar","comprar","añadir al carrito","reservar","regístrate","iniciar sesión","probar","contacto","más información",
+          // PT
+          "começar","comprar","adicionar ao carrinho","reservar","inscrever-se","entrar","experimentar","contato","saiba mais",
+          // IT
+          "inizia","compra","aggiungi al carrello","prenota","iscriviti","accedi","prova","contattaci","scopri di più"
+        ];
+        function hasCta(el) {
+          const t = (el.innerText || "").toLowerCase();
+          return PHRASES.some((p) => t.includes(p));
+        }
+        const candidates = Array.from(document.querySelectorAll("a,button,[role='button']"))
+          .filter((el) => isVisible(el));
+        // First CTA appearing within fold
+        let firstInFold = false;
+        for (const el of candidates) {
+          const r = el.getBoundingClientRect();
+          if (r.top >= 0 && r.bottom <= window.innerHeight) {
+            if (hasCta(el)) { firstInFold = true; break; }
+          }
+        }
+        return { firstCtaInFold: firstInFold };
+      }
+
+      // Fonts (min/max px) within fold
+      function foldFontStats() {
+        const els = Array.from(document.querySelectorAll("body *")).filter(isVisible);
+        let minFont = Infinity, maxFont = 0;
+        els.forEach((el) => {
+          const r = el.getBoundingClientRect();
+          if (r.bottom <= 0 || r.top >= vh) return;
+          const px = parseFloat(getComputedStyle(el).fontSize || "0");
+          if (px > 0) {
+            minFont = Math.min(minFont, px);
+            maxFont = Math.max(maxFont, px);
+          }
+        });
+        return {
+          minFontPx: Number.isFinite(minFont) ? Math.round(minFont) : 0,
+          maxFontPx: Math.round(maxFont),
         };
       }
 
+      function smallTapTargetsCount() {
+        const targets = Array.from(document.querySelectorAll("a,button,[role='button'],input[type='button'],input[type='submit']"))
+          .filter(isVisible);
+        let count = 0;
+        targets.forEach((el) => {
+          const r = el.getBoundingClientRect();
+          // Ignore common chat widgets anchored bottom-right
+          const isChatBubble = (r.width <= 64 && r.height <= 64 && r.right >= vw - 80 && r.bottom >= vh - 140);
+          if (isChatBubble) return;
+          if (r.top < vh && r.bottom > 0) {
+            if (Math.min(r.width, r.height) < 44) count++;
+          }
+        });
+        return count;
+      }
+
+      function hasViewportMeta() {
+        return !!document.querySelector('meta[name="viewport"]');
+      }
+
+      const textRects = rectsForTextNodes();
+      const mediaRects = rectsForMedia();
+      const heroRects = rectsForHeroBackgrounds();
+
+      const allRects = textRects.concat(mediaRects, heroRects);
+      const coveredCells = rasterizeToGrid(allRects);
+
+      const paintedCoveragePct = 100; // reserved (legacy/debug)
+      const foldCoveragePct = Math.round((coveredCells.length / (GRID_ROWS * GRID_COLS)) * 100);
+
+      const { firstCtaInFold } = ctaDetection();
+      const { minFontPx, maxFontPx } = foldFontStats();
+      const smallTaps = smallTapTargetsCount();
+
+      // Visible fold coverage prior to overlay hide (we don't compute here; handled pre-hide); keep visibleFoldCoveragePct as alias of clean for now.
+      const visibleFoldCoveragePct = foldCoveragePct;
+
+      // Detect presence of CSS safe-area usage (advisory only)
+      const usesSafeAreaCSS = (() => {
+        // quick heuristic: look for "env(safe-area-inset" in inline stylesheets
+        const sheets = Array.from(document.querySelectorAll("style"));
+        return sheets.some((s) => (s.textContent || "").includes("safe-area-inset"));
+      })();
+
       return {
-        firstCtaInFold,
-        visibleFoldCoveragePct,
-        paintedCoveragePct: pct(paintedCells),
-        overlayCoveragePct,
-        overlayBlockers,
-        overlayElemsMarked: overlayCandidates.length,
-        maxFontPx, minFontPx, smallTapTargets, hasViewportMeta,
-        usesSafeAreaCSS: false,        // intentionally kept advisory + disabled
-        debug
+        ux: {
+          firstCtaInFold,
+          foldCoveragePct,
+          visibleFoldCoveragePct,
+          paintedCoveragePct,
+          maxFontPx,
+          minFontPx,
+          smallTapTargets: smallTaps,
+          hasViewportMeta: hasViewportMeta(),
+          usesSafeAreaCSS,
+        },
+        debugRects: {
+          rows: GRID_ROWS,
+          cols: GRID_COLS,
+          glyphRects: textRects.map((r) => r.map((n) => Math.round(n))),
+          mediaRects: mediaRects.map((r) => r.map((n) => Math.round(n))),
+          heroBgRects: heroRects.map((r) => r.map((n) => Math.round(n))),
+          coveredCells
+        }
       };
-    }, { wantRects: debugRects });
-    const audit_ms = Date.now() - tAudit0;
-
-    /* ------------------------- Optional overlay shot ------------------------ */
-    let pngWithOverlayBase64 = null;
-    if (debugOverlay) {
-      const bufOverlay = await page.screenshot({ type: "png", fullPage: false, clip: { x: 0, y: 0, width: conf.vp.width, height: conf.vp.height } });
-      pngWithOverlayBase64 = bufOverlay.toString("base64");
-    }
-
-    /* ------------------ Hide overlays → clean audit & shot ------------------ */
-    const tHide0 = Date.now();
-    await hideOverlaysAndUnlock(page);
-    await page.waitForTimeout(120);
-    const hide_ms = Date.now() - tHide0;
-
-    const tClean0 = Date.now();
-    const clean = await evalCleanFold(page);
-    const clean_ms = Date.now() - tClean0;
-
-    // Overwrite fields we score/show
-    ux.foldCoveragePct = clean.foldCoveragePct;
-    ux.firstCtaInFold  = clean.firstCtaInFold;
-
-    // Optional heatmap (clean view)
-    let pngDebugBase64 = null, debugMeta = null;
-    if (debugHeatmap) {
-      const dbg = await drawAndSnapHeatmap(page, { rows: 40, cols: 24 });
-      pngDebugBase64 = dbg.pngDebugBase64;
-      debugMeta = dbg.debugMeta;
-    }
-
-    // Clean screenshot (shown to users)
-    const tShot0 = Date.now();
-    const buf = await page.screenshot({
-      type: "png",
-      fullPage: false,
-      clip: { x: 0, y: 0, width: conf.vp.width, height: conf.vp.height },
     });
-    const pngBase64 = buf.toString("base64");
-    const screenshot_ms = Date.now() - tShot0;
+  },
 
-    // Device meta
-    const meta = {
-      viewport: { width: conf.vp.width, height: conf.vp.height },
-      dpr: conf.profile.deviceScaleFactor || 1,
-      ua: conf.profile.userAgent || null,
-      label: conf.label,
+  // Draw heatmap overlay (clean) and screenshot result
+  async heatmapPng(page, debugRects) {
+    await page.addScriptTag({
+      content: `(() => {
+        const prev = document.getElementById("_foldy_heatmap");
+        if (prev) prev.remove();
+        const c = document.createElement("canvas");
+        c.id = "_foldy_heatmap";
+        c.width = window.innerWidth;
+        c.height = window.innerHeight;
+        c.style.position = "fixed";
+        c.style.left = "0"; c.style.top = "0";
+        c.style.zIndex = "9999999";
+        c.style.pointerEvents = "none";
+        document.body.appendChild(c);
+      })();`,
+      type: "text/javascript",
+    });
+    const buf = await page.screenshot({ type: "png", fullPage: false });
+    await page.evaluate(({ debugRects }) => {
+      const canvas = document.getElementById("_foldy_heatmap");
+      if (!canvas) return;
+      const ctx = canvas.getContext("2d");
+      const w = canvas.width, h = canvas.height;
+
+      // overlay grid coverage
+      const cols = debugRects.cols, rows = debugRects.rows;
+      const cellW = w / cols, cellH = h / rows;
+
+      ctx.lineWidth = 1;
+      ctx.strokeStyle = "rgba(0,0,0,0.2)";
+
+      // cells
+      debugRects.coveredCells.forEach((idx) => {
+        const gy = Math.floor(idx / cols);
+        const gx = idx % cols;
+        ctx.fillStyle = "rgba(0, 255, 0, 0.20)"; // do not color-control externally; fixed here
+        ctx.fillRect(gx * cellW, gy * cellH, cellW, cellH);
+      });
+
+      function drawRects(rects, color) {
+        ctx.strokeStyle = color;
+        rects.forEach(([x,y,w,h]) => {
+          ctx.strokeRect(x, y, w, h);
+        });
+      }
+      drawRects(debugRects.glyphRects, "rgba(0,128,0,0.7)");
+      drawRects(debugRects.mediaRects, "rgba(0,0,255,0.7)");
+      drawRects(debugRects.heroBgRects, "rgba(255,165,0,0.8)");
+    }, { debugRects });
+    const png = await page.screenshot({ type: "png", fullPage: false });
+    await page.evaluate(() => {
+      document.getElementById("_foldy_heatmap")?.remove();
+    });
+    return png;
+  }
+};
+
+/** ---------- /health ---------- **/
+app.get("/health", (_req, res) => {
+  res.json({ ok: true, up: true });
+});
+
+/** ---------- /render ---------- **/
+app.post("/render", authMiddleware, async (req, res) => {
+  const t0 = now();
+  const q = req.query || {};
+  const body = req.body || {};
+
+  const urlRaw = (body.url || q.url || "").trim();
+  const deviceKey = (body.device || q.device || "").trim();
+  const debugOverlay = parseInt(body.debugOverlay ?? q.debugOverlay ?? 0, 10) === 1;
+  const debugRects = parseInt(body.debugRects ?? q.debugRects ?? 0, 10) === 1;
+  const debugHeatmap = parseInt(body.debugHeatmap ?? q.debugHeatmap ?? 0, 10) === 1;
+
+  if (!urlRaw || !deviceKey) {
+    return res.status(400).json({ error: "Missing url or device" });
+  }
+
+  try {
+    const safeUrl = await assertUrlAllowed(urlRaw);
+    const device = deviceFromKey(deviceKey);
+    if (!device) {
+      return res.status(400).json({ error: "Invalid device" });
+    }
+
+    const browser = await getBrowser();
+    const context = await browser.newContext(device.contextOpts);
+    const page = await context.newPage();
+    await prepPage(page);
+
+    const navStart = now();
+    let asSeenPngBuf = null;
+
+    // Navigate & settle
+    await page.goto(safeUrl, { waitUntil: "domcontentloaded" });
+    await page.waitForLoadState("networkidle", { timeout: 5000 }).catch(() => {});
+    const navEnd = now();
+
+    // Optional pre-hide PNG
+    if (debugOverlay) {
+      asSeenPngBuf = await PAGE_EVAL.asSeen(page);
+    }
+
+    // Pre-hide audit (overlay scan)
+    const preStart = now();
+    const pre = await PAGE_EVAL.preHideOverlays(page);
+    const preEnd = now();
+
+    // Hide overlays
+    const hideStart = now();
+    await PAGE_EVAL.hideOverlays(page, pre.overlayRects || []);
+    const hideEnd = now();
+
+    // Clean audit
+    const cleanStart = now();
+    const { ux, debugRects: rectsForDebug } = await PAGE_EVAL.cleanAudit(page);
+    const cleanEnd = now();
+
+    // Clean screenshot
+    const shotStart = now();
+    const cleanPngBuf = await page.screenshot({ type: "png", fullPage: false });
+    const shotEnd = now();
+
+    // Optional heatmap PNG (clean)
+    let heatmapBuf = null;
+    if (debugHeatmap) {
+      heatmapBuf = await PAGE_EVAL.heatmapPng(page, rectsForDebug);
+    }
+
+    await context.close();
+
+    const deviceMeta = {
+      viewport: device.contextOpts.viewport,
+      dpr: device.contextOpts.deviceScaleFactor,
+      ua: device.contextOpts.userAgent,
+      label: device.label,
     };
 
-    // Build response
     const payload = {
-      device,
-      deviceMeta: meta,
-      pngBase64, // CLEAN (overlay removed)
-      ux,
+      device: deviceKey,
+      deviceMeta,
+      pngBase64: cleanPngBuf.toString("base64"),
+      ux: {
+        ...ux,
+        overlayCoveragePct: pre.overlayCoveragePct,
+        overlayBlockers: pre.overlayBlockers,
+        overlayElemsMarked: pre.overlayElemsMarked,
+      },
       timings: {
-        nav_ms,
-        settle_ms,
-        audit_ms,
-        hide_ms,
-        clean_ms,
-        screenshot_ms,
-        total_ms: Date.now() - start,
+        nav_ms: ms(navStart, navEnd),
+        settle_ms: 0,              // kept for compatibility; we fold into nav
+        audit_ms: ms(preStart, preEnd),
+        hide_ms: ms(hideStart, hideEnd),
+        clean_ms: ms(cleanStart, cleanEnd),
+        screenshot_ms: ms(shotStart, shotEnd),
+        total_ms: ms(t0, now()),
       },
     };
-    if (debugOverlay && pngWithOverlayBase64) payload.pngWithOverlayBase64 = pngWithOverlayBase64;
-    if (debugRects && ux.debug) payload.debug = ux.debug;
-    if (debugHeatmap && pngDebugBase64) payload.pngDebugBase64 = pngDebugBase64;
-    if (debugHeatmap && debugMeta) payload.debugMeta = debugMeta;
 
-    res.json(payload);
-  } catch (e) {
-    res.status(500).json({ error: String(e) });
-  } finally {
-    try { if (context) await context.close(); } catch {}
+    if (debugOverlay && asSeenPngBuf) {
+      payload.pngWithOverlayBase64 = asSeenPngBuf.toString("base64");
+    }
+    if (debugRects) {
+      payload.debug = rectsForDebug;
+    }
+    if (debugHeatmap && heatmapBuf) {
+      payload.pngDebugBase64 = heatmapBuf.toString("base64");
+    }
+
+    return res.json(payload);
+  } catch (err) {
+    const status = err?.status || 500;
+    console.error("Render error:", err?.message || err);
+    return res.status(status).json({ error: String(err?.message || err) });
   }
 });
 
-/* --------------------------- Graceful shutdown ---------------------------- */
-process.on("SIGTERM", async () => {
-  try { if (browser) await browser.close(); } finally { process.exit(0); }
-});
+/** ---------- Boot ---------- **/
+let server;
+getBrowser()
+  .then(() => {
+    server = app.listen(PORT, () => {
+      console.log(`Foldy render up on :${PORT}`);
+    });
+  })
+  .catch((e) => {
+    console.error("Failed to launch Chromium:", e);
+    process.exit(1);
+  });
 
-app.listen(PORT, () => {
-  console.log(`foldy-render up on :${PORT}`);
+// Graceful shutdown
+process.on("SIGTERM", async () => {
+  try {
+    await (await getBrowser()).close();
+  } catch {}
+  server?.close?.(() => process.exit(0));
 });
