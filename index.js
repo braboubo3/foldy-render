@@ -528,7 +528,6 @@ const PAGE_EVAL = {
       })();`,
       type: "text/javascript",
     });
-    const buf = await page.screenshot({ type: "png", fullPage: false });
     await page.evaluate(({ debugRects }) => {
       const canvas = document.getElementById("_foldy_heatmap");
       if (!canvas) return;
