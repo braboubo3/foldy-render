@@ -1,204 +1,271 @@
-# foldy-render
+# Foldy — Render Service
 
-Playwright microservice for **Foldy** (mobile fold auditor).  
-**One request per device** → headless Chromium → returns:
-- First-viewport **screenshot** (base64 PNG)
-- **DOM audit** JSON (CTA-in-fold, fonts, tap targets, overlays, viewport meta, safe-area)
-- **Timings** (nav/audit/screenshot/total)
-
-> Built to run in a Playwright-ready container (Docker). Perfect for Render.com Hobby/Basic.
+**Mobile-ready, fold-first audits.**  
+This service renders popular mobile devices, **hides cookie overlays**, measures **above-the-fold** content, and returns a **clean screenshot** + **metrics**. n8n aggregates results across devices and merges **PSI Mobile** (PageSpeed Insights) into the final score.
 
 ---
 
-## Endpoints
+## Quick links
+- 👉 [CONTEXT.md](./CONTEXT.md) — source of truth  
+- 🔌 [API.md](./API.md) — `/render` contract + examples  
+- 🧮 [SCORING.md](./SCORING.md) — rubric (Fold + PSI)  
+- 🗺️ [ARCHITECTURE.md](./ARCHITECTURE.md) — data flow  
+- 🗄️ [DB.sql](./DB.sql) — Supabase schema  
+- 🔁 [WORKFLOW.md](./WORKFLOW.md) — n8n orchestration  
+- 🛠️ [RUNBOOK.md](./RUNBOOK.md) — deploy & smoke tests  
+- 📝 [CHANGELOG.md](./CHANGELOG.md)
 
-### `GET /health`
-Warm-up & liveness.
+> If any link 404s, create that file using the templates in this project.
 
-**Response**
+---
+
+## What this repo is
+
+This is the **rendering microservice** for Foldy:
+
+- **Input:** `{ url, device }`  
+- **Output:** first-viewport **clean PNG** (overlay removed) + **fold audit JSON**  
+- **Devices (MVP):** iPhone 15 Pro/Max, Pixel 8, Galaxy S23, iPhone SE (2nd)
+
+The **MVP report** is built by n8n on top: it fans out to 5 devices, merges results, pulls **PSI Mobile**, scores, stores to **Supabase**, and the **Lovable/Next.js** UI reads from there.
+
+---
+
+## API (summary)
+
+**POST** `/render`  
+**Auth:** `Authorization: Bearer <RENDER_TOKEN>`
+
+**Body**
 ```json
-{ "ok": true, "up": true }
-POST /render (auth required)
-Body:
+{
+  "url": "https://example.com",
+  "device": "iphone_15_pro",
+  "debugOverlay": false,
+  "debugRects": false,
+  "debugHeatmap": false
+}
+```
 
-json
-{ "url": "https://example.com", "device": "iphone_15_pro" }
-Header:
-
-pgsql
-Authorization: Bearer <RENDER_TOKEN>
-Content-Type: application/json
-Response (abridged)
-
-json
+**200 Response (abridged)**
+```jsonc
 {
   "device": "iphone_15_pro",
-  "deviceMeta": { "viewport": { "width": 393, "height": 852 }, "dpr": 3, "ua": "..." },
-  "pngBase64": "<base64 PNG>",
+  "deviceMeta": {
+    "viewport": { "width": 393, "height": 852 },
+    "dpr": 3,
+    "ua": "...",
+    "label": "iPhone 15 Pro"
+  },
+  "pngBase64": "<CLEAN fold PNG>",
   "ux": {
     "firstCtaInFold": true,
-    "foldCoveragePct": 62,
-    "maxFontPx": 28,
-    "minFontPx": 14,
+    "foldCoveragePct": 60,
+    "visibleFoldCoveragePct": 68,
+    "paintedCoveragePct": 100,
+    "overlayCoveragePct": 83,
+    "overlayBlockers": 1,
+    "overlayElemsMarked": 1,
+    "maxFontPx": 32,
+    "minFontPx": 12,
     "smallTapTargets": 3,
     "hasViewportMeta": true,
-    "overlayBlockers": 1,
     "usesSafeAreaCSS": false
   },
-  "timings": { "nav_ms": 1234, "settle_ms": 800, "audit_ms": 40, "screenshot_ms": 20, "total_ms": 2230 }
+  "timings": {
+    "nav_ms": 10500,
+    "settle_ms": 801,
+    "audit_ms": 604,
+    "hide_ms": 216,
+    "clean_ms": 88,
+    "screenshot_ms": 10088,
+    "total_ms": 22766
+  },
+  "pngWithOverlayBase64": "<optional>",        // if debugOverlay=1
+  "pngDebugBase64": "<optional heatmap PNG>",  // if debugHeatmap=1
+  "debug": {
+    "rows": 40,
+    "cols": 24,
+    "glyphRects": [...],
+    "mediaRects": [...],
+    "heroBgRects": [...],
+    "overlayRects": [...],
+    "coveredCells": [...],
+    "overlayCells": [...]
+  } // if debugRects=1
 }
-Supported devices (PoC):
+```
 
-iphone_se_2 (375×667)
+See **API.md** for full payloads and cURL examples.
 
-iphone_15_pro (393×852)
-
-iphone_15_pro_max (430×932)
-
-pixel_8 (412×915)
-
-galaxy_s23 (360×800)
-
-Quick start (Render.com)
-Repo contents (at root):
-
-index.js (Express + Playwright app)
-
-package.json (with "type":"module" and postinstall)
-
-Dockerfile (uses Playwright base image)
-
-.gitignore
-
-Create Web Service on Render → choose this repo → runtime Docker → Hobby plan is fine.
-
-Env vars:
-
-RENDER_TOKEN=<long-random-string>
-
-PORT=3000 (optional; Render also provides one)
-
-Settings → Health Check Path = /health.
-
-Test:
-
-bash
-curl -s https://<service>.onrender.com/health
-curl -s -X POST https://<service>.onrender.com/render \
-  -H "Authorization: Bearer <RENDER_TOKEN>" \
-  -H "Content-Type: application/json" \
-  -d '{"url":"https://example.com","device":"iphone_15_pro"}' | jq .
-Run locally with Docker
-Requires Docker. Using the Playwright image avoids OS deps headaches.
-
-bash
-# build
-docker build -t foldy-render:local .
-
-# run
-docker run --rm -p 3000:3000 -e RENDER_TOKEN=mydevtoken foldy-render:local
-
-# health
-curl -s http://localhost:3000/health
-
-# render
-curl -s -X POST http://localhost:3000/render \
-  -H "Authorization: Bearer mydevtoken" \
-  -H "Content-Type: application/json" \
-  -d '{"url":"https://example.com","device":"iphone_15_pro"}' | jq .
-Environment variables
-Name	Required	Description
-RENDER_TOKEN	Yes	Bearer token for /render requests
-PORT	No	Port to bind (Render injects automatically)
-
-Never commit secrets to the repo. Use platform env vars.
-
-Notes & safety
-Basic SSRF guard: only http/https URLs; blocks localhost and private ranges (MVP-level).
-
-Each request uses a fresh browser context; the Chromium browser is kept warm.
-
-We clip the screenshot to the first viewport (not full-page).
-
-We block heavy 3rd-party scripts (analytics/video) to stabilize renders.
-
-Project structure
-pgsql
-.
-├── Dockerfile
-├── index.js
-├── package.json
-└── .gitignore
-License
-MIT (or your choice)
-
-perl
 ---
 
-### `.github/pull_request_template.md`
-```markdown
-## Summary
-<!-- What does this PR change? One or two sentences. -->
+## Local development
 
-## Changes
-- [ ] Endpoint(s):
-  - [ ] `/health`
-  - [ ] `/render`
-- [ ] Logic:
-  - [ ] Device map
-  - [ ] DOM audit heuristics
-  - [ ] Screenshot behavior
-  - [ ] Timings / metrics
-- [ ] Infra:
-  - [ ] Dockerfile
-  - [ ] Env var handling
-  - [ ] Auth (Bearer token)
+Prod runs on Render.com (Playwright image + deps). Local is for quick tests.
 
-## Testing
-- [ ] Local Docker run (`/health` OK)
-- [ ] Local `/render` with `iphone_15_pro` returns base64 + `ux` + `timings`
-- [ ] Tested 2–3 real URLs (Shopify PDP, SaaS lander, blog)
-- [ ] Error path: invalid URL returns `400`; missing auth returns `401`
-
-**Commands**
 ```bash
-# build & run
-docker build -t foldy-render:local .
-docker run --rm -p 3000:3000 -e RENDER_TOKEN=mydevtoken foldy-render:local
+# 1) Install deps
+npm install
+npx playwright install chromium
 
-# smoke
-curl -s localhost:3000/health
-curl -s -X POST localhost:3000/render -H "Authorization: Bearer mydevtoken" \
+# 2) Run
+export RENDER_TOKEN=devtoken
+npm start     # listens on :3000
+
+# 3) Health
+curl -s http://localhost:3000/health
+# → {"ok":true,"up":true}
+
+# 4) Smoke test
+curl -s -X POST "http://localhost:3000/render" \
+  -H "Authorization: Bearer $RENDER_TOKEN" \
   -H "Content-Type: application/json" \
-  -d '{"url":"https://example.com","device":"iphone_15_pro"}' | jq .
-Deployment checklist (Render)
- Repo has Dockerfile at root
+  -d '{"url":"https://example.com","device":"iphone_15_pro"}' | jq '.ux'
+```
 
- Service created on Render → Web Service
+---
 
- Health Check Path set to /health
+## Docker
 
- Env var RENDER_TOKEN set (long random string)
+```bash
+# Build
+docker build -t foldy-render .
 
- Smoke test against the Render URL passes
+# Run
+docker run -p 3000:3000 -e RENDER_TOKEN=devtoken foldy-render
 
-Security & Ops
- No secrets committed (checked .env, index.js, Dockerfile)
+# Test
+curl -s -X POST "http://localhost:3000/render" \
+  -H "Authorization: Bearer devtoken" \
+  -H "Content-Type: application/json" \
+  -d '{"url":"https://example.com","device":"iphone_15_pro"}' | jq '.ux'
+```
 
- SSRF guard still in place
+---
 
- Auth required for /render
+## Deploy on Render.com
 
- Logs show context/browser closing (no leaks)
+- **Service type:** Web Service  
+- **Runtime:** Docker  
+- **Plan:** Hobby (upgrade as needed)
 
-Follow-ups (optional)
- Add more device profiles (exact UA/DPR)
+**Environment variables**
+- `RENDER_TOKEN` — random secret string  
+- `PORT=3000`
 
- Tune timeouts/retries
+**Dockerfile should:**
+- `npm ci --omit=dev`  
+- `npx playwright install --with-deps chromium`  
+- `npm start`
 
- Add semaphore for concurrency (later)
+**Health check:** `GET /health` → `{"ok":true,"up":true}`
 
- Metrics to Supabase/n8n
+See **RUNBOOK.md** for detailed steps and smoke tests.
 
-Screenshots (optional)
-<!-- Paste any relevant terminal output or screenshots -->
+---
+
+## Environment variables
+
+| Variable      | Required | Default | Purpose                     |
+|---------------|----------|---------|-----------------------------|
+| `RENDER_TOKEN`| ✅        | —       | Bearer auth for `/render`   |
+| `PORT`        | ✅        | `3000`  | Express port                |
+
+---
+
+## Security
+
+- Bearer auth required for `/render`.  
+- SSRF guard: http/https only; blocks localhost and private ranges.  
+- Network hygiene: aborts analytics/video to stabilize loads.  
+- Keep secrets in env vars (Render dashboard), not in code.
+
+---
+
+## Debug modes
+
+- `debugOverlay=1` → also returns as-seen PNG (pre-hide)  
+- `debugRects=1` → returns rect arrays + covered cells (JSON)  
+- `debugHeatmap=1` → returns heatmap PNG (clean view)
+
+Legend:
+- **Green** = text glyphs  
+- **Blue** = media (IMG/VIDEO/SVG/CANVAS)  
+- **Amber** = large non-repeating hero backgrounds
+
+**Example:**
+```bash
+curl -s -X POST "$RENDER_URL/render?debugHeatmap=1" \
+  -H "Authorization: Bearer $RENDER_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"url":"https://poslik.com","device":"iphone_15_pro"}' \
+  | jq -r '.pngDebugBase64' | base64 --decode > fold-heatmap.png
+```
+
+---
+
+## Performance notes
+
+- One shared Chromium per process; 1 context/request.  
+- Timeouts: navigation ~15s; typical device call 5–12s on average pages.  
+- Animations disabled for faster rasterization.  
+- Heavy third parties blocked by default.
+
+---
+
+## Integration (n8n + Supabase + UI)
+
+### n8n (MVP flow)
+Webhook → validate URL → create `runs(pending)` → PSI Mobile → loop 5 devices calling `/render` → compute per-device scores + overall → upload PNGs to Supabase Storage → insert `run_devices` → update `runs(complete)` → respond with `run_id`.
+
+### Supabase schema
+See **DB.sql**. We store:
+
+- `runs`: id, url, status, overall_score, psi_json, created_at  
+- `run_devices`: per-device metrics + screenshot_url, timings, raw
+
+### UI (Lovable/Next.js)
+
+- `/` submit URL → returns `run_id`  
+- `/report/[id]` polls Supabase until complete; displays device cards, PSI, and the **Mobile-Ready Score** (Fold 60% + Vitals 40%).  
+- Scoring details: **SCORING.md**.
+
+---
+
+## Troubleshooting
+
+**“missing dependencies to run browsers”**  
+Ensure build step runs: `npx playwright install --with-deps chromium`
+
+**401 Unauthorized**  
+Missing/incorrect `RENDER_TOKEN` header.
+
+**Slow screenshots / timeouts**  
+We disable animations and block heavy 3P; if still slow, increase nav timeout slightly.
+
+**Overlay/header confusion**  
+Use `debugHeatmap=1` + `debugRects=1` to visualize. Heuristics exclude typical headers and detect cookie bars/dialogs.
+
+**Tap targets inflated by chat widgets**  
+We ignore common chat bubbles anchored bottom-right.
+
+---
+
+## Roadmap & status
+
+MVP = Fold + PSI (in progress).
+
+Next: safe-area detector (advisory), notch overlap check, optional occlusion pass, shareable links & per-device badges.
+
+Track changes in **CHANGELOG.md**.
+
+---
+
+## License
+
+Proprietary (MVP-phase). Decide OSS/commercial license before public release.
+
+---
+
+> Starting a new ChatGPT thread? Paste **CONTEXT.md** as your first message.
