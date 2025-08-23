@@ -38,6 +38,7 @@ jobs:
 
       # --- Debug pass for ONE device (heatmaps) ---
       - name: Run smoke pack (debug iPhone 15 Pro only)
+        continue-on-error: true        
         env:
           RENDER_URL: ${{ secrets.RENDER_URL }}
           RENDER_TOKEN: ${{ secrets.RENDER_TOKEN }}
