@@ -332,49 +332,38 @@ const PAGE_EVAL = {
         const rects = [];
         const vw = window.innerWidth, vh = window.innerHeight;
       
-        // Alpha from rgb/rgba()
+        // Unicode whitespace set (space, NBSP, hair, narrow, ZW, BOM, etc.)
+        const WS = /[\s\u00A0\u1680\u180E\u2000-\u200B\u202F\u205F\u3000\uFEFF]/;
+      
+        // Quick alpha extractor for rgba()
         const alphaOf = (cssColor) => {
           const m = /\brgba?\(\s*([\d.]+)\s*,\s*([\d.]+)\s*,\s*([\d.]+)(?:\s*,\s*([\d.]+))?\s*\)/i.exec(cssColor || "");
           return m ? (m[4] === undefined ? 1 : parseFloat(m[4])) : 1;
         };
-        // Treat ALL space-likes as whitespace (incl. nbsp/hair/narrow/zero-width)
-        const WS_CHAR_RE = /^[\s\u00A0\u1680\u180E\u2000-\u200B\u202F\u205F\u3000\uFEFF]$/;
-      
-        // Is the character at (x,y) whitespace?
-        function isWhitespaceAt(x, y) {
-          const caretPos = (document.caretPositionFromPoint && document.caretPositionFromPoint(x, y)) || null;
-          if (caretPos && caretPos.offsetNode && caretPos.offsetNode.nodeType === Node.TEXT_NODE) {
-            const s = caretPos.offsetNode.nodeValue || "";
-            const i = Math.min(Math.max(caretPos.offset, 0), Math.max(0, s.length - 1));
-            return WS_CHAR_RE.test(s[i] || "");
-          }
-          const caretRange = (document.caretRangeFromPoint && document.caretRangeFromPoint(x, y)) || null;
-          if (caretRange && caretRange.startContainer && caretRange.startContainer.nodeType === Node.TEXT_NODE) {
-            const s = caretRange.startContainer.nodeValue || "";
-            const i = Math.min(Math.max(caretRange.startOffset, 0), Math.max(0, s.length - 1));
-            return WS_CHAR_RE.test(s[i] || "");
-          }
-          return false;
-        }
       
         const walker = document.createTreeWalker(
           document.body,
           NodeFilter.SHOW_TEXT,
           {
             acceptNode: (n) => {
-              // Strip zero-widths & BOM; reject nodes with no real characters left
-              const raw = (n.nodeValue || "").replace(/[\u200B\u200C\u200D\uFEFF]/g, "");
-              if (!/[^\s\u00A0\u1680\u180E\u2000-\u200B\u202F\u205F\u3000]/.test(raw)) {
+              const s = n.nodeValue || "";
+              // Find first/last non-whitespace char in ORIGINAL string
+              let i = 0, j = s.length - 1;
+              while (i <= j && WS.test(s[i])) i++;
+              while (j >= i && WS.test(s[j])) j--;
+              if (j < i) return NodeFilter.FILTER_REJECT; // all whitespace
+      
+              const el = n.parentElement;
+              if (!el) return NodeFilter.FILTER_REJECT;
+              // Visible parent + not nearly transparent
+              const cs = getComputedStyle(el);
+              if (cs.visibility === "hidden" || cs.display === "none" || parseFloat(cs.opacity || "1") < 0.05) {
                 return NodeFilter.FILTER_REJECT;
               }
-              const el = n.parentElement;
-              if (!el || !isVisible(el)) return NodeFilter.FILTER_REJECT;
-      
-              const cs = getComputedStyle(el);
               const fs = parseFloat(cs.fontSize || "0");
               if (fs < 8) return NodeFilter.FILTER_REJECT;
       
-              // Transparent text (color alpha 0 or -webkit-text-fill-color transparent)
+              // Transparent text (via color or -webkit-text-fill-color)
               const aColor = alphaOf(cs.color);
               const fill = cs.webkitTextFillColor || "";
               const fillTransparent = fill === "transparent" || /rgba\(\s*0\s*,\s*0\s*,\s*0\s*,\s*0\s*\)/i.test(fill);
@@ -387,11 +376,22 @@ const PAGE_EVAL = {
       
         let node;
         while ((node = walker.nextNode())) {
-          const el = node.parentElement;
-          const fs = parseFloat(getComputedStyle(el).fontSize || "0");
+          const s = node.nodeValue || "";
+          // Trim to the non-whitespace span again (we need indices now)
+          let start = 0, end = s.length - 1;
+          while (start <= end && WS.test(s[start])) start++;
+          while (end >= start && WS.test(s[end])) end--;
+          if (end < start) continue; // safety
+      
+          // Build a range for ONLY the non-whitespace subset
           const range = document.createRange();
           try {
-            range.selectNodeContents(node);
+            range.setStart(node, start);
+            range.setEnd(node, end + 1);
+      
+            const el = node.parentElement;
+            const fs = parseFloat(getComputedStyle(el).fontSize || "0");
+      
             const list = range.getClientRects(); // per-line fragments
             for (const r of list) {
               let x = Math.max(0, Math.min(r.left, vw));
@@ -400,12 +400,7 @@ const PAGE_EVAL = {
               let h = Math.max(0, Math.min(r.bottom, vh) - y);
               if (w <= 1 || h <= 6) continue;
       
-              // Heuristic: if the rect center sits on whitespace, skip (filters leading/trailing space fragments)
-              const cx = Math.min(vw - 1, x + Math.max(1, Math.min(w - 1, fs * 0.6)));
-              const cy = Math.min(vh - 1, y + h / 2);
-              if (isWhitespaceAt(cx, cy)) continue;
-      
-              // shrink vertical paint to ~font-size height
+              // shrink vertical paint to ~ font-size height
               const targetH = Math.min(h, Math.max(8, fs * 1.3));
               const dy = (h - targetH) / 2;
               y = Math.max(0, Math.min(y + dy, vh));
@@ -421,6 +416,7 @@ const PAGE_EVAL = {
         }
         return rects;
       }
+
 
 
       function rectsForMedia() {
@@ -687,6 +683,7 @@ const PAGE_EVAL = {
       drawRects(debugRects.mediaRects,  "rgba(0,0,255,0.7)");
       drawRects(debugRects.ctaRects,    "rgba(128,0,128,0.85)");
       drawRects(debugRects.heroBgRects, "rgba(255,165,0,0.8)");
+      drawRects(debugRects.smallTapRects, "rgba(255, 215, 0, 0.95)"); // small tap targets
     }, debugRects);
 
     const png = await page.screenshot({ type: "png", fullPage: false, timeout: HEATMAP_TIMEOUT_MS - 500 });
@@ -699,6 +696,19 @@ const PAGE_EVAL = {
 app.get("/health", (_req, res) => res.json({ ok: true, up: true }));
 
 app.post("/render", authMiddleware, async (req, res) => {
+  
+    const relaxed = (process.env.RENDER_DISABLE_TIMEOUTS === "1") ||
+    (parseInt(body.relaxed ?? q.relaxed ?? 0, 10) === 1);
+  
+  // per-request wrapper that bypasses timeouts when relaxed
+  const WT = (p, ms, label) => (relaxed ? p : withTimeout(p, ms, label));
+  
+  // When relaxed, also loosen the socket timeout
+  if (relaxed) {
+    res.setTimeout(Math.max(120000, (HARD_TIMEOUT_MS || 45000) * 3));
+    req.setTimeout?.(Math.max(120000, (HARD_TIMEOUT_MS || 45000) * 3));
+  }
+
   // keep sockets from hanging (slightly > HARD_TIMEOUT_MS)
   res.setTimeout(HARD_TIMEOUT_MS + 5000);
   req.setTimeout?.(HARD_TIMEOUT_MS + 5000);
@@ -721,34 +731,34 @@ app.post("/render", authMiddleware, async (req, res) => {
     const device = deviceFromKey(deviceKey);
     if (!device) return res.status(400).json({ error: "Invalid device" });
 
-    const browser = await withTimeout(getBrowser(), 10000, "launch chromium");
+    const browser = await WT(getBrowser(), 10000, "launch chromium");
     // bypassCSP helps debug overlays/heatmap injection
-    context = await withTimeout(browser.newContext({ ...device.contextOpts, bypassCSP: true }), 8000, "newContext");
-    page = await withTimeout(context.newPage(), 5000, "newPage");
+    context = await WT(browser.newContext({ ...device.contextOpts, bypassCSP: true }), 8000, "newContext");
+    page = await WT(context.newPage(), 5000, "newPage");
     await prepPage(page);
 
     const navStart = now();
     let asSeenPngBuf = null;
-    await withTimeout(page.goto(safeUrl, { waitUntil: "domcontentloaded" }), 15000, "page.goto");
+    await WT(page.goto(safeUrl, { waitUntil: "domcontentloaded" }), 15000, "page.goto");
     await page.waitForLoadState("networkidle", { timeout: 5000 }).catch(() => {});
     const navEnd = now();
 
-    if (debugOverlay) asSeenPngBuf = await withTimeout(PAGE_EVAL.asSeen(page), SNAP_TIMEOUT_MS, "asSeen screenshot");
+    if (debugOverlay) asSeenPngBuf = await WT(PAGE_EVAL.asSeen(page), SNAP_TIMEOUT_MS, "asSeen screenshot");
 
     const preStart = now();
-    const pre = await withTimeout(PAGE_EVAL.preHideOverlays(page), 7000, "preHideOverlays");
+    const pre = await WT(PAGE_EVAL.preHideOverlays(page), 7000, "preHideOverlays");
     const preEnd = now();
 
     const hideStart = now();
-    await withTimeout(PAGE_EVAL.hideOverlays(page), 2000, "hideOverlays");
+    await WT(PAGE_EVAL.hideOverlays(page), 2000, "hideOverlays");
     const hideEnd = now();
 
     const cleanStart = now();
-    const { ux, debugRects: rectsForDebug } = await withTimeout(PAGE_EVAL.cleanAudit(page), 9000, "cleanAudit");
+    const { ux, debugRects: rectsForDebug } = await WT(PAGE_EVAL.cleanAudit(page), 9000, "cleanAudit");
     const cleanEnd = now();
 
     const shotStart = now();
-    const cleanPngBuf = await withTimeout(
+    const cleanPngBuf = await WT(
       page.screenshot({ type: "png", fullPage: false, timeout: SHOT_TIMEOUT_MS - 1000 }),
       SHOT_TIMEOUT_MS,
       "clean screenshot"
@@ -757,7 +767,7 @@ app.post("/render", authMiddleware, async (req, res) => {
 
     let heatmapBuf = null;
     if (debugHeatmap) {
-      heatmapBuf = await withTimeout(PAGE_EVAL.heatmapPng(page, rectsForDebug), HEATMAP_TIMEOUT_MS, "heatmapPng");
+      heatmapBuf = await WT(PAGE_EVAL.heatmapPng(page, rectsForDebug), HEATMAP_TIMEOUT_MS, "heatmapPng");
     }
 
     const deviceMeta = {
