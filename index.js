@@ -317,34 +317,49 @@ const PAGE_EVAL = {
 
       function rectsForTextNodes() {
         const rects = [];
-        const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT, {
-          acceptNode: (n) => {
-            if (!n.nodeValue || !n.nodeValue.trim()) return NodeFilter.FILTER_REJECT;
-            const el = n.parentElement;
-            if (!el) return NodeFilter.FILTER_REJECT;
-            if (!isVisible(el)) return NodeFilter.FILTER_REJECT;
-            const style = getComputedStyle(el);
-            const fontPx = parseFloat(style.fontSize || "0");
-            if (fontPx < 8) return NodeFilter.FILTER_REJECT;
-            return NodeFilter.FILTER_ACCEPT;
+        const vw = window.innerWidth, vh = window.innerHeight;
+        // Walk text nodes; accept only visible, legible text
+        const walker = document.createTreeWalker(
+          document.body,
+          NodeFilter.SHOW_TEXT,
+          {
+            acceptNode: (n) => {
+              if (!n.nodeValue || !n.nodeValue.trim()) return NodeFilter.FILTER_REJECT;
+              const el = n.parentElement;
+              if (!el) return NodeFilter.FILTER_REJECT;
+              if (!isVisible(el)) return NodeFilter.FILTER_REJECT;
+              const fs = parseFloat(getComputedStyle(el).fontSize || "0");
+              if (fs < 8) return NodeFilter.FILTER_REJECT;
+              return NodeFilter.FILTER_ACCEPT;
+            }
           }
-        });
+        );
         let node;
         while ((node = walker.nextNode())) {
           const range = document.createRange();
           try {
             range.selectNodeContents(node);
-            const r = range.getBoundingClientRect();
-            if (r && r.width > 0 && r.height > 0 && r.top < vh && r.left < vw && r.bottom > 0 && r.right > 0) {
-              const x = clamp(r.left, 0, vw), y = clamp(r.top, 0, vh);
-              const w = clamp(r.right, 0, vw) - x, h = clamp(r.bottom, 0, vh) - y;
+            // Use per-line fragments instead of one giant box
+            const list = range.getClientRects();
+            for (const r of list) {
+              // clamp to viewport
+              let x = Math.max(0, Math.min(r.left, vw));
+              let y = Math.max(0, Math.min(r.top, vh));
+              let w = Math.max(0, Math.min(r.right, vw) - x);
+              let h = Math.max(0, Math.min(r.bottom, vh) - y);
+              // drop tiny fragments (noise)
+              if (w <= 1 || h <= 6) continue;
+              // erode 1px to avoid counting gutters/padding
+              x = Math.min(x  1, vw); y = Math.min(y  1, vh);
+              w = Math.max(0, w - 2);  h = Math.max(0, h - 2);
               if (w > 0 && h > 0) rects.push([x, y, w, h]);
             }
-          } catch {}
+          } catch { /* noop */ }
           range.detach?.();
         }
         return rects;
       }
+
 
       function rectsForMedia() {
         const sels = "img,video,svg,canvas";
