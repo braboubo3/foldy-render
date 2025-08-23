@@ -34,11 +34,20 @@ jobs:
         env:
           RENDER_URL: ${{ secrets.RENDER_URL }}
           RENDER_TOKEN: ${{ secrets.RENDER_TOKEN }}
-        run: node scripts/run-pack.mjs tests/pack.smoke.yaml --out=artifacts-ci --devices=all --debug=0
-
-      - name: Upload artifacts
+       run: |
+         node scripts/run-pack.mjs tests/pack.smoke.yaml --out=artifacts-ci-debug --devices=iphone_15_pro --debug=1
+         node scripts/run-pack.mjs tests/pack.smoke.yaml --out=artifacts-ci --devices=all --debug=0
+      - name: Upload normal artifacts
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: foldy-smoke-${{ github.run_id }}
+          name: foldy-smoke-normal-${{ github.run_id }}
           path: artifacts-ci/**
+      
+      - name: Upload debug artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: foldy-smoke-debug-${{ github.run_id }}
+          path: artifacts-ci-debug/**
+  
