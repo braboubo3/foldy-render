@@ -367,19 +367,67 @@ const PAGE_EVAL = {
           const cs = getComputedStyle(el);
           const bg = cs.backgroundImage;
           if (!bg || bg === "none") return;
+      
+          // Ignore gradients outright
+          if (/gradient\(/i.test(bg)) return;
+      
+          // Extract background-image URLs (single-layer only for hero)
+          const urlMatches = bg.match(/url\((?:[^)(]|\((?:[^)(]+|\([^)(]*\))*\))*\)/g) || [];
+          if (urlMatches.length !== 1) return;
+          const url0 = urlMatches[0].replace(/^url\(["']?/, "").replace(/["']?\)$/, "");
+      
+          const isRaster = /\.(jpe?g|png|webp|avif)(\?|$)/i.test(url0) ||
+                           /^data:image\/(jpeg|jpg|png|webp|avif)/i.test(url0);
+          const isSvg = /\.svg(\?|$)/i.test(url0) ||
+                        /^data:image\/svg\+xml/i.test(url0);
+      
           const repeat = cs.backgroundRepeat || "";
           const size = cs.backgroundSize || "";
-          const nonRepeating = repeat.includes("no-repeat");
-          const large = size.includes("cover") || size.includes("contain");
+          const nonRepeating = /no-repeat/i.test(repeat);
+          const large = /cover|contain/i.test(size);
           if (!nonRepeating && !large) return;
+      
+          const vw = window.innerWidth, vh = window.innerHeight;
           const r = el.getBoundingClientRect();
           const x = clamp(r.left, 0, vw), y = clamp(r.top, 0, vh);
           const w = clamp(r.right, 0, vw) - x, h = clamp(r.bottom, 0, vh) - y;
+          if (w <= 0 || h <= 0) return;
+      
+          // Must be a substantial chunk of the fold
+          const foldArea = vw * vh;
           const area = w * h;
-          if (area / (vw * vh) >= 0.25) rects.push([x, y, w, h]);
+          const bigEnough =
+            area / foldArea >= 0.35 && // ≥35% of fold
+            w >= 0.60 * vw &&          // wide enough
+            h >= 0.30 * vh;            // tall enough
+          if (!bigEnough) return;
+      
+          // Avoid double-counting if the section contains a big foreground media
+          const hasBigMediaChild = Array.from(el.querySelectorAll("img,video,svg,canvas")).some((child) => {
+            if (!isVisible(child)) return false;
+            const cr = child.getBoundingClientRect();
+            const cx = clamp(cr.left, 0, vw), cy = clamp(cr.top, 0, vh);
+            const cw = clamp(cr.right, 0, vw) - cx, chh = clamp(cr.bottom, 0, vh) - cy;
+            const carea = Math.max(0, cw * chh);
+            return carea / foldArea >= 0.20; // large child media present
+          });
+          if (hasBigMediaChild) return;
+      
+          // Accept rules
+          if (isRaster) {
+            rects.push([x, y, w, h]);
+            return;
+          }
+          if (isSvg) {
+            // Only count SVG backgrounds if they act like a real hero: substantial overlay text
+            const textLen = (el.innerText || "").trim().length;
+            if (textLen >= 30) rects.push([x, y, w, h]);
+            return;
+          }
         });
         return rects;
       }
+
 
       function rasterizeToGrid(rects) {
         const covered = new Set();
