@@ -277,7 +277,9 @@ const PAGE_EVAL = {
       function clamp(n, lo, hi) { return Math.max(lo, Math.min(hi, n)); }
       function isVisible(el) {
         const cs = getComputedStyle(el);
-        if (cs.visibility === "hidden" || cs.display === "none" || cs.opacity === "0") return false;
+        // Skip hidden/none/fully transparent elements
+        if (cs.visibility === "hidden" || cs.display === "none") return false;
+        if (parseFloat(cs.opacity || "1") < 0.05) return false;
         const r = el.getBoundingClientRect();
         if (r.width <= 0 || r.height <= 0) return false;
         if (r.bottom <= 0 || r.right <= 0 || r.top >= vh || r.left >= vw) return false;
@@ -325,18 +327,41 @@ const PAGE_EVAL = {
       // --- Rect collectors ---
       function rectsForTextNodes() {
         const rects = [];
+        const vw = window.innerWidth, vh = window.innerHeight;
+      
+        // helper: alpha from "rgb/rgba()"
+        const alphaOf = (cssColor) => {
+          const m = /\brgba?\(\s*([\d.]+)\s*,\s*([\d.]+)\s*,\s*([\d.]+)(?:\s*,\s*([\d.]+))?\s*\)/i.exec(cssColor || "");
+          return m ? (m[4] === undefined ? 1 : parseFloat(m[4])) : 1;
+        };
+      
         const walker = document.createTreeWalker(
-          document.body, NodeFilter.SHOW_TEXT,
-          { acceptNode: (n) => {
-              if (!n.nodeValue || !n.nodeValue.trim()) return NodeFilter.FILTER_REJECT;
+          document.body,
+          NodeFilter.SHOW_TEXT,
+          {
+            acceptNode: (n) => {
+              // Remove zero-width & BOM, then check for any non-space
+              const raw = (n.nodeValue || "").replace(/[\u200B\u200C\u200D\uFEFF]/g, "");
+              if (!/[^\s]/.test(raw)) return NodeFilter.FILTER_REJECT;
+      
               const el = n.parentElement;
               if (!el || !isVisible(el)) return NodeFilter.FILTER_REJECT;
-              const fs = parseFloat(getComputedStyle(el).fontSize || "0");
+      
+              const cs = getComputedStyle(el);
+              const fs = parseFloat(cs.fontSize || "0");
               if (fs < 8) return NodeFilter.FILTER_REJECT;
+      
+              // Transparent text (via color or -webkit-text-fill-color)
+              const aColor = alphaOf(cs.color);
+              const fill = cs.webkitTextFillColor || "";
+              const fillTransparent = fill === "transparent" || /rgba\(\s*0\s*,\s*0\s*,\s*0\s*,\s*0\s*\)/i.test(fill);
+              if (aColor < 0.05 || fillTransparent) return NodeFilter.FILTER_REJECT;
+      
               return NodeFilter.FILTER_ACCEPT;
             }
           }
         );
+      
         let node;
         while ((node = walker.nextNode())) {
           const el = node.parentElement;
@@ -344,22 +369,23 @@ const PAGE_EVAL = {
           const range = document.createRange();
           try {
             range.selectNodeContents(node);
-            const list = range.getClientRects(); // per-line
+            const list = range.getClientRects(); // per-line fragments
             for (const r of list) {
               let x = Math.max(0, Math.min(r.left, vw));
               let y = Math.max(0, Math.min(r.top, vh));
               let w = Math.max(0, Math.min(r.right, vw) - x);
               let h = Math.max(0, Math.min(r.bottom, vh) - y);
               if (w <= 1 || h <= 6) continue;
-
+      
+              // shrink vertical paint to ~font-size height
               const targetH = Math.min(h, Math.max(8, fs * 1.3));
               const dy = (h - targetH) / 2;
               y = Math.max(0, Math.min(y + dy, vh));
               h = Math.max(0, Math.min(targetH, vh - y));
-
+      
+              // erosion to avoid gutters
               x = Math.min(x + 1, vw); y = Math.min(y + 1, vh);
               w = Math.max(0, w - 2);  h = Math.max(0, h - 2);
-
               if (w > 0 && h > 0) rects.push([x, y, w, h]);
             }
           } catch {}
@@ -367,6 +393,7 @@ const PAGE_EVAL = {
         }
         return rects;
       }
+
 
       function rectsForMedia() {
         const rects = [];
