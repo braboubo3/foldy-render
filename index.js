@@ -252,58 +252,56 @@ const PAGE_EVAL = {
       }
 
       // Text: per-line fragments (tighter than one giant box) + 1px erosion
-      function rectsForTextNodes() {
-        const rects = [];
-        const vw = window.innerWidth, vh = window.innerHeight;
-      
-        const walker = document.createTreeWalker(
-          document.body, NodeFilter.SHOW_TEXT,
-          {
-            acceptNode: (n) => {
-              if (!n.nodeValue || !n.nodeValue.trim()) return NodeFilter.FILTER_REJECT;
-              const el = n.parentElement;
-              if (!el) return NodeFilter.FILTER_REJECT;
-              if (!isVisible(el)) return NodeFilter.FILTER_REJECT;
-              const fs = parseFloat(getComputedStyle(el).fontSize || "0");
-              if (fs < 8) return NodeFilter.FILTER_REJECT;
-              return NodeFilter.FILTER_ACCEPT;
-            }
-          }
-        );
-      
-        let node;
-        while ((node = walker.nextNode())) {
-          const el = node.parentElement;
-          const fs = parseFloat(getComputedStyle(el).fontSize || "0");
-          const range = document.createRange();
-          try {
-            range.selectNodeContents(node);
-            // per-line fragments
-            const list = range.getClientRects();
-            for (const r of list) {
-              // clamp to viewport
-              let x = Math.max(0, Math.min(r.left, vw));
-              let y = Math.max(0, Math.min(r.top, vh));
-              let w = Math.max(0, Math.min(r.right, vw) - x);
-              let h = Math.max(0, Math.min(r.bottom, vh) - y);
-              if (w <= 1 || h <= 6) continue;
-      
-              // shrink vertical paint to ~font-size (avoid counting full line-height box)
-              const targetH = Math.min(h, Math.max(8, fs * 1.3));
-              const dy = (h - targetH) / 2;
-              y = Math.max(0, Math.min(y + dy, vh));
-              h = Math.max(0, Math.min(targetH, vh - y));
-      
-              // 1px erosion to avoid gutters
-              x = Math.min(x + 1, vw); y = Math.min(y + 1, vh);
-              w = Math.max(0, w - 2);  h = Math.max(0, h - 2);
-              if (w > 0 && h > 0) rects.push([x, y, w, h]);
-            }
-          } catch {}
-          range.detach?.();
-        }
-        return rects;
+function rectsForTextNodes() {
+  const rects = [];
+  const vw = window.innerWidth, vh = window.innerHeight;
+
+  const walker = document.createTreeWalker(
+    document.body, NodeFilter.SHOW_TEXT,
+    { acceptNode: (n) => {
+        if (!n.nodeValue || !n.nodeValue.trim()) return NodeFilter.FILTER_REJECT;
+        const el = n.parentElement;
+        if (!el || !isVisible(el)) return NodeFilter.FILTER_REJECT;
+        const fs = parseFloat(getComputedStyle(el).fontSize || "0");
+        if (fs < 8) return NodeFilter.FILTER_REJECT;
+        return NodeFilter.FILTER_ACCEPT;
       }
+    }
+  );
+
+  let node;
+  while ((node = walker.nextNode())) {
+    const el = node.parentElement;
+    const fs = parseFloat(getComputedStyle(el).fontSize || "0");
+    const range = document.createRange();
+    try {
+      range.selectNodeContents(node);
+      const list = range.getClientRects(); // per-line
+      for (const r of list) {
+        let x = Math.max(0, Math.min(r.left, vw));
+        let y = Math.max(0, Math.min(r.top, vh));
+        let w = Math.max(0, Math.min(r.right, vw) - x);
+        let h = Math.max(0, Math.min(r.bottom, vh) - y);
+        if (w <= 1 || h <= 6) continue;
+
+        // shrink vertical paint to ~ font-size height
+        const targetH = Math.min(h, Math.max(8, fs * 1.3));
+        const dy = (h - targetH) / 2;
+        y = Math.max(0, Math.min(y + dy, vh));
+        h = Math.max(0, Math.min(targetH, vh - y));
+
+        // erode 1px to avoid gutters
+        x = Math.min(x + 1, vw); y = Math.min(y + 1, vh);
+        w = Math.max(0, w - 2);  h = Math.max(0, h - 2);
+
+        if (w > 0 && h > 0) rects.push([x, y, w, h]);
+      }
+    } catch {}
+    range.detach?.();
+  }
+  return rects;
+}
+
 
 
       // Foreground media (counts as-is)
@@ -320,46 +318,48 @@ const PAGE_EVAL = {
       }
 
       // Count full CTA hit-area, with per-CTA cap (≤6% of fold)
-      function rectsForCTAs() {
-        const rects = [];
-        const capArea = 0.06 * (vw * vh); // ≤6% of fold per CTA
-        const minDim = 32;                // allow slightly smaller than 44px
-        const minArea = 0.015 * (vw * vh);
-      
-        const btns = Array.from(document.querySelectorAll("a,button,[role='button']"))
-          .filter(isVisible)
-          .filter((el) => hasCta(el)); // <- only elements that look like CTAs
-      
-        for (const el of btns) {
-          const r = el.getBoundingClientRect();
-          // ignore off-fold and chat bubbles
-          const isChatBubble = (r.width <= 64 && r.height <= 64 && r.right >= vw - 80 && r.bottom >= vh - 140);
-          if (isChatBubble) continue;
-          if (r.bottom <= 0 || r.top >= vh) continue;
-      
-          // clamp to fold
-          let x = clamp(r.left, 0, vw), y = clamp(r.top, 0, vh);
-          let w = clamp(r.right, 0, vw) - x, h = clamp(r.bottom, 0, vh) - y;
-          if (w <= 0 || h <= 0) continue;
-      
-          // skip tiny chips unless area is meaningful
-          const area = w * h;
-          if (Math.min(w, h) < minDim && area < minArea) continue;
-      
-          // cap contribution
-          if (area > capArea) {
-            const scale = Math.sqrt(capArea / area);
-            const nw = Math.max(1, w * scale), nh = Math.max(1, h * scale);
-            const cx = x + w / 2, cy = y + h / 2;
-            x = clamp(cx - nw / 2, 0, vw);
-            y = clamp(cy - nh / 2, 0, vh);
-            w = clamp(x + nw, 0, vw) - x;
-            h = clamp(y + nh, 0, vh) - y;
-          }
-          rects.push([x, y, w, h]);
-        }
-        return rects;
-      }
+function rectsForCTAs() {
+  const rects = [];
+  const capArea = 0.06 * (vw * vh); // ≤6% per CTA
+  const minDim  = 32;               // allow slightly smaller than 44px
+  const minArea = 0.015 * (vw * vh);
+
+  const btns = Array.from(document.querySelectorAll("a,button,[role='button']"))
+    .filter(isVisible)
+    .filter((el) => hasCtaText(el) || looksLikeButton(el));
+
+  for (const el of btns) {
+    const r = el.getBoundingClientRect();
+
+    // ignore off-fold and chat bubbles
+    const isChatBubble = (r.width <= 64 && r.height <= 64 && r.right >= vw - 80 && r.bottom >= vh - 140);
+    if (isChatBubble) continue;
+    if (r.bottom <= 0 || r.top >= vh) continue;
+
+    // clamp to fold
+    let x = clamp(r.left, 0, vw), y = clamp(r.top, 0, vh);
+    let w = clamp(r.right, 0, vw) - x, h = clamp(r.bottom, 0, vh) - y;
+    if (w <= 0 || h <= 0) continue;
+
+    // skip tiny chips unless they still have meaningful area
+    const area = w * h;
+    if (Math.min(w, h) < minDim && area < minArea) continue;
+
+    // cap contribution
+    if (area > capArea) {
+      const scale = Math.sqrt(capArea / area);
+      const nw = Math.max(1, w * scale), nh = Math.max(1, h * scale);
+      const cx = x + w / 2, cy = y + h / 2;
+      x = clamp(cx - nw / 2, 0, vw);
+      y = clamp(cy - nh / 2, 0, vh);
+      w = clamp(x + nw, 0, vw) - x;
+      h = clamp(y + nh, 0, vh) - y;
+    }
+    rects.push([x, y, w, h]);
+  }
+  return rects;
+}
+
 
 
       // Large, non-repeating hero backgrounds (raster preferred; SVG allowed in a narrow case)
@@ -371,31 +371,34 @@ const PAGE_EVAL = {
           const cs = getComputedStyle(el);
           const bg = cs.backgroundImage;
           if (!bg || bg === "none") return;
-          if (/gradient\(/i.test(bg)) return; // ignore gradients
-
-          // Only consider single-layer backgrounds for hero logic
+      
+          // Ignore gradients and ANY SVG background (decorative patterns like poslik)
+          if (/gradient\(/i.test(bg)) return;
           const urls = bg.match(/url\((?:[^)(]|\((?:[^)(]+|\([^)(]*\))*\))*\)/g) || [];
-          if (urls.length !== 1) return;
+          if (urls.length !== 1) return; // hero is single image layer only
           const url0 = urls[0].replace(/^url\(["']?/, "").replace(/["']?\)$/, "");
-
           const isRaster = /\.(jpe?g|png|webp|avif)(\?|$)/i.test(url0) ||
                            /^data:image\/(jpeg|jpg|png|webp|avif)/i.test(url0);
           const isSvg = /\.svg(\?|$)/i.test(url0) || /^data:image\/svg\+xml/i.test(url0);
-
+          if (!isRaster || isSvg) return; // <- raster only
+      
+          // large + non-repeating
           const nonRepeating = /no-repeat/i.test(cs.backgroundRepeat || "");
           const large = /cover|contain/i.test(cs.backgroundSize || "");
           if (!nonRepeating && !large) return;
-
+      
+          const vw = window.innerWidth, vh = window.innerHeight;
           const r = el.getBoundingClientRect();
           const x = clamp(r.left, 0, vw), y = clamp(r.top, 0, vh);
           const w = clamp(r.right, 0, vw) - x, h = clamp(r.bottom, 0, vh) - y;
           if (w <= 0 || h <= 0) return;
-
+      
+          const foldArea = vw * vh;
           const area = w * h;
-          const bigEnough = (area / foldArea >= 0.35) && (w >= 0.60 * vw) && (h >= 0.30 * vh);
+          const bigEnough = (area / foldArea >= 0.45) && (w >= 0.70 * vw) && (h >= 0.35 * vh);
           if (!bigEnough) return;
-
-          // Avoid double counting when a big foreground media exists inside the section
+      
+          // Avoid double counting if a big foreground media exists inside
           const hasBigMediaChild = Array.from(el.querySelectorAll("img,video,svg,canvas")).some((child) => {
             if (!isVisible(child)) return false;
             const cr = child.getBoundingClientRect();
@@ -404,18 +407,12 @@ const PAGE_EVAL = {
             return (cw * ch) / foldArea >= 0.20;
           });
           if (hasBigMediaChild) return;
-
-          if (isRaster) {
-            rects.push([x, y, w, h]);
-            return;
-          }
-          if (isSvg) {
-            const textLen = (el.innerText || "").trim().length;
-            if (textLen >= 30) rects.push([x, y, w, h]); // narrow allowance for true SVG heroes
-          }
+      
+          rects.push([x, y, w, h]);
         });
         return rects;
       }
+
 
       function rasterizeToGrid(rects) {
         const covered = new Set();
@@ -434,45 +431,75 @@ const PAGE_EVAL = {
       }
 
       function norm(t) {
-          return (t || "")
-            .toLowerCase()
-            .normalize("NFD").replace(/[\u0300-\u036f]/g, ""); // strip accents
-        }
-        const CTA_PHRASES = [
-          // EN
-          "get started","start now","request a demo","book a demo","request demo",
-          "buy","add to cart","sign up","log in","subscribe","try","contact","learn more",
-          // FR
-          "demander une demo","demander une démo","essayer","nous contacter","en savoir plus",
-          "commencer","acheter","ajouter au panier","reserver","réserver","s'inscrire","se connecter",
-          // DE
-          "demo anfordern","jetzt starten","kaufen","in den warenkorb","buchen","registrieren","anmelden","testen","kontakt","mehr erfahren",
-          // ES
-          "solicitar una demo","empezar","comprar","añadir al carrito","reservar","regístrate","iniciar sesion","iniciar sesión","probar","contacto","mas informacion","más información",
-          // PT
-          "solicitar uma demo","comecar","começar","comprar","adicionar ao carrinho","reservar","inscrever-se","entrar","experimentar","contato","saiba mais",
-          // IT
-          "richiedi una demo","inizia","compra","aggiungi al carrello","prenota","iscriviti","accedi","prova","contattaci","scopri di piu","scopri di più"
-        ];
-        function hasCta(el) {
-          const t = norm(el.innerText || "");
-          if (t.length < 3) return false;
-          return CTA_PHRASES.some(p => t.includes(p));
-        }
+        return (t || "")
+          .toLowerCase()
+          .normalize("NFD").replace(/[\u0300-\u036f]/g, ""); // strip accents
+      }
+      
+      const CTA_PHRASES = [
+        // EN
+        "get started","start now","request a demo","book a demo","request demo",
+        "buy","add to cart","sign up","log in","subscribe","try","contact","learn more",
+        // FR
+        "demander une demo","demander une démo","essayer","nous contacter","en savoir plus",
+        "commencer","acheter","ajouter au panier","reserver","réserver","s'inscrire","se connecter",
+        // DE
+        "demo anfordern","jetzt starten","kaufen","in den warenkorb","buchen","registrieren","anmelden","testen","kontakt","mehr erfahren",
+        // ES
+        "solicitar una demo","empezar","comprar","añadir al carrito","reservar",
+        "regístrate","iniciar sesion","iniciar sesión","probar","contacto","mas informacion","más información",
+        // PT
+        "solicitar uma demo","comecar","começar","comprar","adicionar ao carrinho","reservar",
+        "inscrever-se","entrar","experimentar","contato","saiba mais",
+        // IT
+        "richiedi una demo","inizia","compra","aggiungi al carrello","prenota","iscriviti","accedi","prova","contattaci","scopri di piu","scopri di più"
+      ];
+      
+      function hasCtaText(el) {
+        const t = norm(el.innerText || "");
+        return t.length > 2 && CTA_PHRASES.some(p => t.includes(p));
+      }
+      
+      // Class/style/role heuristics for buttons (covers “COMPTE PRO” etc.)
+      function looksLikeButton(el) {
+        const role = (el.getAttribute("role") || "").toLowerCase();
+        const type = (el.getAttribute("type") || "").toLowerCase();
+        const cls = (el.className || "").toString().toLowerCase();
+        const id = (el.id || "").toLowerCase();
+      
+        const classHit = /\b(btn|button|cta|primary|pill|calltoaction|call-to-action)\b/.test(cls)
+                      || /\b(btn|button|cta|primary|pill)\b/.test(id)
+                      || /\b(btn-|button-|cta-|primary-)/.test(cls);
+      
+        const roleHit  = role === "button";
+        const typeHit  = type === "button" || type === "submit";
+      
+        // visual hint: obvious background and some radius
+        const cs = getComputedStyle(el);
+        const hasBg = cs.backgroundColor && cs.backgroundColor !== "rgba(0, 0, 0, 0)" && cs.backgroundColor !== "transparent";
+        const radius = parseFloat(cs.borderTopLeftRadius || "0") +
+                       parseFloat(cs.borderTopRightRadius || "0") +
+                       parseFloat(cs.borderBottomLeftRadius || "0") +
+                       parseFloat(cs.borderBottomRightRadius || "0");
+        const rounded = radius >= 12;
+      
+        return classHit || roleHit || typeHit || (hasBg && rounded);
+      }
 
 
-        function ctaDetection() {
-          const candidates = Array.from(document.querySelectorAll("a,button,[role='button']"))
-            .filter(isVisible)
-            .filter(el => hasCta(el));
-        
-          let firstInFold = false;
-          for (const el of candidates) {
-            const r = el.getBoundingClientRect();
-            if (r.top >= 0 && r.bottom <= window.innerHeight) { firstInFold = true; break; }
-          }
-          return { firstCtaInFold: firstInFold };
+      
+      function ctaDetection() {
+        const candidates = Array.from(document.querySelectorAll("a,button,[role='button']"))
+          .filter(isVisible)
+          .filter(el => hasCtaText(el) || looksLikeButton(el));
+        let firstInFold = false;
+        for (const el of candidates) {
+          const r = el.getBoundingClientRect();
+          if (r.top >= 0 && r.bottom <= window.innerHeight) { firstInFold = true; break; }
         }
+        return { firstCtaInFold: firstInFold };
+      }
+
 
 
       function foldFontStats() {
