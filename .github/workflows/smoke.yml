@@ -1,20 +1,26 @@
 name: Foldy Smoke
+
 on:
   pull_request:
   workflow_dispatch:
   schedule:
-    - cron: "17 3 * * *"  # daily @ 03:17 UTC
+    - cron: '17 3 * * *'  # daily @ 03:17 UTC
 
 jobs:
   smoke:
     runs-on: ubuntu-latest
-    permissions: { contents: read }
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
-        with: { node-version: "20" }
+    permissions:
+      contents: read
 
-      # Wake cold Render dyno (retry up to ~2 min)
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
       - name: Warm up Render service
         env:
           RENDER_URL: ${{ secrets.RENDER_URL }}
@@ -27,27 +33,28 @@ jobs:
           done
           echo "Service didn't wake in time"; exit 1
 
-      # Minimal deps for the runner
-      - run: npm i -D js-yaml node-fetch
+      - name: Install runner deps
+        run: npm i -D js-yaml node-fetch
 
-      - name: Run smoke pack
+      # --- Debug pass for ONE device (heatmaps) ---
+      - name: Run smoke pack (debug iPhone 15 Pro only)
         env:
           RENDER_URL: ${{ secrets.RENDER_URL }}
           RENDER_TOKEN: ${{ secrets.RENDER_TOKEN }}
-       run: |
-         node scripts/run-pack.mjs tests/pack.smoke.yaml --out=artifacts-ci-debug --devices=iphone_15_pro --debug=1
-         node scripts/run-pack.mjs tests/pack.smoke.yaml --out=artifacts-ci --devices=all --debug=0
-      - name: Upload normal artifacts
+        run: node scripts/run-pack.mjs tests/pack.smoke.yaml --out=artifacts-ci-debug --devices=iphone_15_pro --debug=1
+
+      # --- Normal pass for the rest ---
+      - name: Run smoke pack (normal all devices)
+        env:
+          RENDER_URL: ${{ secrets.RENDER_URL }}
+          RENDER_TOKEN: ${{ secrets.RENDER_TOKEN }}
+        run: node scripts/run-pack.mjs tests/pack.smoke.yaml --out=artifacts-ci --devices=all --debug=0
+
+      - name: Upload artifacts
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: foldy-smoke-normal-${{ github.run_id }}
-          path: artifacts-ci/**
-      
-      - name: Upload debug artifacts
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: foldy-smoke-debug-${{ github.run_id }}
-          path: artifacts-ci-debug/**
-  
+          name: foldy-smoke-${{ github.run_id }}
+          path: |
+            artifacts-ci/**
+            artifacts-ci-debug/**
