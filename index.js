@@ -194,12 +194,20 @@ const PAGE_EVAL = {
         const inFoldWidth = Math.max(0, Math.min(r.right, vw) - Math.max(r.left, 0));
         const inFoldHeight = Math.max(0, Math.min(r.bottom, vh) - Math.max(r.top, 0));
         const inFoldArea = inFoldWidth * inFoldHeight;
-        if (inFoldArea / foldArea < 0.12 && !(r.height > 48 && r.top > vh - 200)) return false;
-
         const txt = (el.innerText || "").toLowerCase();
-        const looksLikeCookie = txt.includes("cookie") || txt.includes("consent") || txt.includes("accept all") || txt.includes("agree");
-        const likelyBar = r.height >= 48 && r.top >= vh - 220;
-        return looksLikeCookie || likelyBar || inFoldArea / foldArea >= 0.25;
+        const looksLikeCookie =
+          txt.includes("cookie") || txt.includes("consent") ||
+          txt.includes("accept all") || txt.includes("agree");
+        // bottom bar must be wide and contain at least two actionable items
+        const btnCount = el.querySelectorAll("button,a,[role='button']").length;
+        const wideBar = (inFoldWidth / vw) >= 0.6;
+        const likelyBar = (r.height >= 48 && r.top >= vh - 220 && wideBar && btnCount >= 2);
+
+        // keep: explicit cookie/consent, or large fixed overlays
+        if (looksLikeCookie) return true;
+        if (likelyBar) return true;
+        // otherwise require a larger area to avoid tagging tiny pills
+        return inFoldArea / foldArea >= 0.20;
       });
 
       // Tag actual overlay nodes so we can hide only them
@@ -598,13 +606,24 @@ function rectsForCTAs() {
       const cols = debugRects.cols, rows = debugRects.rows;
       const cellW = w / cols, cellH = h / rows;
 
-      // grid fill
+      // 1) grid fill (what we count)
       debugRects.coveredCells.forEach((idx) => {
         const gy = Math.floor(idx / cols);
         const gx = idx % cols;
-        ctx.fillStyle = "rgba(0, 255, 0, 0.20)";
+        ctx.fillStyle = "rgba(0, 255, 0, 0.12)";
         ctx.fillRect(gx * cellW, gy * cellH, cellW, cellH);
       });
+
+       // 2) actual rect fills (what we detected) – helps explain “why a cell was counted”
+      function fillRects(rects, color) {
+        ctx.fillStyle = color;
+        rects.forEach(([x,y,w,h]) => { ctx.fillRect(x, y, w, h); });
+      }
+      fillRects(debugRects.glyphRects, "rgba(0,128,0,0.15)");       // text
+      fillRects(debugRects.mediaRects, "rgba(0,0,255,0.12)");       // media
+      fillRects(debugRects.ctaRects || [], "rgba(128,0,128,0.15)"); // CTAs
+      fillRects(debugRects.heroBgRects, "rgba(255,165,0,0.12)");    // hero bg
+     
 
       function drawRects(rects, color) {
         ctx.strokeStyle = color;
@@ -683,7 +702,10 @@ app.post("/render", authMiddleware, async (req, res) => {
       label: device.label,
     };
 
+    const nowDate = new Date();
     const payload = {
+      ts_ms: nowDate.getTime(),
+      ts_iso: nowDate.toISOString(),
       device: deviceKey,
       deviceMeta,
       pngBase64: cleanPngBuf.toString("base64"),
