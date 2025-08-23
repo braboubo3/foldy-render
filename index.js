@@ -696,27 +696,32 @@ const PAGE_EVAL = {
 app.get("/health", (_req, res) => res.json({ ok: true, up: true }));
 
 app.post("/render", authMiddleware, async (req, res) => {
-  
-    const relaxed = (process.env.RENDER_DISABLE_TIMEOUTS === "1") ||
-    (parseInt(body.relaxed ?? q.relaxed ?? 0, 10) === 1);
-  
-  // per-request wrapper that bypasses timeouts when relaxed
-  const WT = (p, ms, label) => (relaxed ? p : withTimeout(p, ms, label));
-  
-  // When relaxed, also loosen the socket timeout
-  if (relaxed) {
-    res.setTimeout(Math.max(120000, (HARD_TIMEOUT_MS || 45000) * 3));
-    req.setTimeout?.(Math.max(120000, (HARD_TIMEOUT_MS || 45000) * 3));
-  }
-
-  // keep sockets from hanging (slightly > HARD_TIMEOUT_MS)
+  // default socket timeouts (we may relax later)
   res.setTimeout(HARD_TIMEOUT_MS + 5000);
   req.setTimeout?.(HARD_TIMEOUT_MS + 5000);
 
   const t0 = now();
+
+  // MUST come first → then we can safely read values from them
   const q = req.query || {};
   const body = req.body || {};
 
+  // Relaxed mode: bypass per-step watchdogs (for n8n batches)
+  const relaxed =
+    (process.env.RENDER_DISABLE_TIMEOUTS === "1") ||
+    (String(body.relaxed ?? q.relaxed ?? "0") === "1");
+
+  // Per-request wrapper that respects relaxed mode
+  const WT = (p, ms, label) => (relaxed ? p : withTimeout(p, ms, label));
+
+  // If relaxed, loosen socket timeouts too
+  if (relaxed) {
+    const long = Math.max(120000, (HARD_TIMEOUT_MS || 45000) * 3); // ≥2 min
+    res.setTimeout(long);
+    req.setTimeout?.(long);
+  }
+
+  // Now read the rest of params
   const urlRaw = (body.url || q.url || "").trim();
   const deviceKey = (body.device || q.device || "").trim();
   const debugOverlay = parseInt(body.debugOverlay ?? q.debugOverlay ?? 0, 10) === 1;
