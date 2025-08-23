@@ -5,24 +5,34 @@ devices:
   - pixel_8
   - iphone_se_2
 tests:
-  - id: example
-    url: https://example.com
+  - id: poslik
+    url: https://poslik.com
     expect:
-      foldCoveragePct: { min: 10, max: 80 }
+      foldCoveragePct: { min: 10, max: 95 }
       overlayCoveragePct: { max: 100 }
       smallTapTargets: { max: 12 }
       hasViewportMeta: false
-  - id: playwright
-    url: https://playwright.dev
+  - id: sellerboard
+    url: https://sellerboard.com
     expect:
       foldCoveragePct: { min: 15, max: 95 }
       overlayCoveragePct: { max: 100 }
       smallTapTargets: { max: 15 }
       hasViewportMeta: true
-  - id: wikipedia
-    url: https://www.wikipedia.org
+  - id: hiutdenim shopify
+    url: https://hiutdenim.co.uk/products/the-hack-japanese-selvedge?Waist=28&Leg+Length=28
     expect:
       foldCoveragePct: { min: 20, max: 95 }
       overlayCoveragePct: { max: 100 }
-      smallTapTargets: { max: 8 }
+      smallTapTargets: { max: 20 }
       hasViewportMeta: true
+
+  - id: cocolab shopify
+    url: https://cocolab.com/products/cocoshine-oishii
+    expect:
+      foldCoveragePct: { min: 20, max: 95 }
+      overlayCoveragePct: { max: 100 }
+      smallTapTargets: { max: 20 }
+      hasViewportMeta: true
+
+      
