@@ -5,10 +5,15 @@ import { chromium } from "playwright";
 import dns from "node:dns/promises";
 import net from "node:net";
 
+
+
 const PORT = process.env.PORT || 3000;
 const RENDER_TOKEN = process.env.RENDER_TOKEN;
-const HARD_TIMEOUT_MS = parseInt(process.env.RENDER_HARD_TIMEOUT_MS || "45000", 10);
-const DNS_TIMEOUT_MS  = parseInt(process.env.RENDER_DNS_TIMEOUT_MS  || "4000", 10);
+const HARD_TIMEOUT_MS   = parseInt(process.env.RENDER_HARD_TIMEOUT_MS   || "45000", 10);
+const DNS_TIMEOUT_MS    = parseInt(process.env.RENDER_DNS_TIMEOUT_MS    || "4000", 10);
+const SHOT_TIMEOUT_MS   = parseInt(process.env.RENDER_SHOT_TIMEOUT_MS   || "15000", 10); // was 8000
+const HEATMAP_TIMEOUT_MS= parseInt(process.env.RENDER_HEATMAP_TIMEOUT_MS|| "10000", 10);
+const SNAP_TIMEOUT_MS   = parseInt(process.env.RENDER_SNAP_TIMEOUT_MS   || "6000", 10);  // for debugOverlay asSeen
 if (!RENDER_TOKEN) {
   console.error("Missing RENDER_TOKEN");
   process.exit(1);
@@ -708,8 +713,9 @@ app.post("/render", authMiddleware, async (req, res) => {
     await page.waitForLoadState("networkidle", { timeout: 5000 }).catch(() => {});
     const navEnd = now();
 
-    if (debugOverlay) asSeenPngBuf = await withTimeout(PAGE_EVAL.asSeen(page), 5000, "asSeen screenshot");
-
+    if (debugOverlay) {
+      asSeenPngBuf = await withTimeout(PAGE_EVAL.asSeen(page), SNAP_TIMEOUT_MS, "asSeen screenshot");
+    }
     const preStart = now();
     const pre = await withTimeout(PAGE_EVAL.preHideOverlays(page), 7000, "preHideOverlays");
     const preEnd = now();
@@ -723,12 +729,21 @@ app.post("/render", authMiddleware, async (req, res) => {
     const cleanEnd = now();
 
     const shotStart = now();
-    const cleanPngBuf = await withTimeout(page.screenshot({ type: "png", fullPage: false }), 8000, "clean screenshot");
+    const cleanPngBuf = await withTimeout(
+      page.screenshot({ type: "png", fullPage: false, timeout: SHOT_TIMEOUT_MS - 1000 }),
+      SHOT_TIMEOUT_MS,
+      "clean screenshot"
+    );
     const shotEnd = now();
 
     let heatmapBuf = null;
-    if (debugHeatmap) heatmapBuf = await withTimeout(PAGE_EVAL.heatmapPng(page, rectsForDebug), 6000, "heatmapPng");
-
+    if (debugHeatmap) {
+      heatmapBuf = await withTimeout(
+        PAGE_EVAL.heatmapPng(page, rectsForDebug),
+        HEATMAP_TIMEOUT_MS,
+        "heatmapPng"
+      );
+    }
     const deviceMeta = {
       viewport: device.contextOpts.viewport,
       dpr: device.contextOpts.deviceScaleFactor,
