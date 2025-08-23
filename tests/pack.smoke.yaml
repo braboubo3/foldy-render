@@ -1,0 +1,28 @@
+version: 1
+name: "Foldy Smoke Pack"
+devices:
+  - iphone_15_pro
+  - pixel_8
+  - iphone_se_2
+tests:
+  - id: example
+    url: https://example.com
+    expect:
+      foldCoveragePct: { min: 10, max: 80 }
+      overlayCoveragePct: { max: 100 }
+      smallTapTargets: { max: 12 }
+      hasViewportMeta: false
+  - id: playwright
+    url: https://playwright.dev
+    expect:
+      foldCoveragePct: { min: 15, max: 95 }
+      overlayCoveragePct: { max: 100 }
+      smallTapTargets: { max: 15 }
+      hasViewportMeta: true
+  - id: wikipedia
+    url: https://www.wikipedia.org
+    expect:
+      foldCoveragePct: { min: 20, max: 95 }
+      overlayCoveragePct: { max: 100 }
+      smallTapTargets: { max: 8 }
+      hasViewportMeta: true
