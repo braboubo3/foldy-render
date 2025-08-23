@@ -619,62 +619,65 @@ function rectsForCTAs() {
 
   // Draw heatmap overlay (single shot) and return PNG
   async heatmapPng(page, debugRects) {
-    await page.addScriptTag({
-      content: `(() => {
-        const prev = document.getElementById("_foldy_heatmap");
-        if (prev) prev.remove();
-        const c = document.createElement("canvas");
-        c.id = "_foldy_heatmap";
-        c.width = window.innerWidth;
-        c.height = window.innerHeight;
-        c.style.position = "fixed";
-        c.style.left = "0"; c.style.top = "0";
-        c.style.zIndex = "9999999";
-        c.style.pointerEvents = "none";
-        document.body.appendChild(c);
-      })();`,
-    });
-    await page.evaluate(({ debugRects }) => {
-      const canvas = document.getElementById("_foldy_heatmap");
-      if (!canvas) return;
-      const ctx = canvas.getContext("2d");
-      const w = canvas.width, h = canvas.height;
+    // Build & draw entirely via page.evaluate (no <script> injection / CSP issues)
+    await page.evaluate((debugRects) => {
+      // create canvas
+      const prev = document.getElementById("_foldy_heatmap");
+      if (prev) prev.remove();
+      const c = document.createElement("canvas");
+      c.id = "_foldy_heatmap";
+      c.width = window.innerWidth;
+      c.height = window.innerHeight;
+      Object.assign(c.style, {
+        position: "fixed",
+        left: "0px",
+        top: "0px",
+        zIndex: "9999999",
+        pointerEvents: "none",
+      });
+      document.body.appendChild(c);
+  
+      const ctx = c.getContext("2d");
+      const w = c.width, h = c.height;
       const cols = debugRects.cols, rows = debugRects.rows;
       const cellW = w / cols, cellH = h / rows;
-
-      // 1) grid fill (what we count)
-      debugRects.coveredCells.forEach((idx) => {
-        const gy = Math.floor(idx / cols);
+  
+      // grid fill (what we count)
+      ctx.fillStyle = "rgba(0,255,0,0.12)";
+      for (let i = 0; i < debugRects.coveredCells.length; i++) {
+        const idx = debugRects.coveredCells[i];
+        const gy = (idx / cols) | 0;
         const gx = idx % cols;
-        ctx.fillStyle = "rgba(0, 255, 0, 0.12)";
         ctx.fillRect(gx * cellW, gy * cellH, cellW, cellH);
-      });
-
-       // 2) actual rect fills (what we detected) – helps explain “why a cell was counted”
-      function fillRects(rects, color) {
-        ctx.fillStyle = color;
-        rects.forEach(([x,y,w,h]) => { ctx.fillRect(x, y, w, h); });
       }
-      fillRects(debugRects.glyphRects, "rgba(0,128,0,0.15)");       // text
-      fillRects(debugRects.mediaRects, "rgba(0,0,255,0.12)");       // media
-      fillRects(debugRects.ctaRects || [], "rgba(128,0,128,0.15)"); // CTAs
-      fillRects(debugRects.heroBgRects, "rgba(255,165,0,0.12)");    // hero bg
-     
-
-      function drawRects(rects, color) {
-        ctx.strokeStyle = color;
-        rects.forEach(([x,y,w,h]) => { ctx.strokeRect(x, y, w, h); });
+  
+      // Draw strokes (keep it light; caps avoid pathological pages)
+      const MAX_STROKES = 2000;
+      let drawn = 0;
+  
+      function drawRects(rects, stroke) {
+        if (!rects) return;
+        ctx.strokeStyle = stroke;
+        const n = Math.min(rects.length, Math.max(0, MAX_STROKES - drawn));
+        for (let i = 0; i < n; i++) {
+          const [x, y, w, h] = rects[i];
+          ctx.strokeRect(x, y, w, h);
+        }
+        drawn += n;
       }
-      drawRects(debugRects.glyphRects, "rgba(0,128,0,0.7)");        // text
-      drawRects(debugRects.mediaRects, "rgba(0,0,255,0.7)");        // media
-      drawRects(debugRects.ctaRects || [], "rgba(128,0,128,0.85)"); // CTAs
-      drawRects(debugRects.heroBgRects, "rgba(255,165,0,0.8)");     // hero bg
-    }, { debugRects });
+  
+      drawRects(debugRects.glyphRects,   "rgba(0,128,0,0.7)");     // text
+      drawRects(debugRects.mediaRects,   "rgba(0,0,255,0.7)");     // media
+      drawRects(debugRects.ctaRects,     "rgba(128,0,128,0.85)");  // CTAs
+      drawRects(debugRects.heroBgRects,  "rgba(255,165,0,0.8)");   // hero bg
+    }, debugRects);
+  
+    // single screenshot
     const png = await page.screenshot({ type: "png", fullPage: false });
-    await page.evaluate(() => { document.getElementById("_foldy_heatmap")?.remove(); });
+    await page.evaluate(() => document.getElementById("_foldy_heatmap")?.remove());
     return png;
   }
-};
+
 
 /** ---------- Routes ---------- **/
 app.get("/health", (_req, res) => res.json({ ok: true, up: true }));
@@ -703,7 +706,11 @@ app.post("/render", authMiddleware, async (req, res) => {
     if (!device) return res.status(400).json({ error: "Invalid device" });
 
     const browser = await withTimeout(getBrowser(), 10000, "launch chromium");
-    context = await withTimeout(browser.newContext(device.contextOpts), 8000, "newContext");
+    context = await withTimeout(
+      browser.newContext({ ...device.contextOpts, bypassCSP: true }),
+      8000,
+      "newContext"
+    );
     page = await withTimeout(context.newPage(), 5000, "newPage");
     await prepPage(page);
 
