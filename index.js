@@ -254,30 +254,47 @@ const PAGE_EVAL = {
       // Text: per-line fragments (tighter than one giant box) + 1px erosion
       function rectsForTextNodes() {
         const rects = [];
-        const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT, {
-          acceptNode: (n) => {
-            if (!n.nodeValue || !n.nodeValue.trim()) return NodeFilter.FILTER_REJECT;
-            const el = n.parentElement;
-            if (!el) return NodeFilter.FILTER_REJECT;
-            if (!isVisible(el)) return NodeFilter.FILTER_REJECT;
-            const fs = parseFloat(getComputedStyle(el).fontSize || "0");
-            if (fs < 8) return NodeFilter.FILTER_REJECT;
-            return NodeFilter.FILTER_ACCEPT;
+        const vw = window.innerWidth, vh = window.innerHeight;
+      
+        const walker = document.createTreeWalker(
+          document.body, NodeFilter.SHOW_TEXT,
+          {
+            acceptNode: (n) => {
+              if (!n.nodeValue || !n.nodeValue.trim()) return NodeFilter.FILTER_REJECT;
+              const el = n.parentElement;
+              if (!el) return NodeFilter.FILTER_REJECT;
+              if (!isVisible(el)) return NodeFilter.FILTER_REJECT;
+              const fs = parseFloat(getComputedStyle(el).fontSize || "0");
+              if (fs < 8) return NodeFilter.FILTER_REJECT;
+              return NodeFilter.FILTER_ACCEPT;
+            }
           }
-        });
+        );
+      
         let node;
         while ((node = walker.nextNode())) {
+          const el = node.parentElement;
+          const fs = parseFloat(getComputedStyle(el).fontSize || "0");
           const range = document.createRange();
           try {
             range.selectNodeContents(node);
+            // per-line fragments
             const list = range.getClientRects();
             for (const r of list) {
+              // clamp to viewport
               let x = Math.max(0, Math.min(r.left, vw));
               let y = Math.max(0, Math.min(r.top, vh));
               let w = Math.max(0, Math.min(r.right, vw) - x);
               let h = Math.max(0, Math.min(r.bottom, vh) - y);
-              if (w <= 1 || h <= 6) continue; // drop tiny fragments
-              // erode to avoid painting gutters
+              if (w <= 1 || h <= 6) continue;
+      
+              // shrink vertical paint to ~font-size (avoid counting full line-height box)
+              const targetH = Math.min(h, Math.max(8, fs * 1.3));
+              const dy = (h - targetH) / 2;
+              y = Math.max(0, Math.min(y + dy, vh));
+              h = Math.max(0, Math.min(targetH, vh - y));
+      
+              // 1px erosion to avoid gutters
               x = Math.min(x + 1, vw); y = Math.min(y + 1, vh);
               w = Math.max(0, w - 2);  h = Math.max(0, h - 2);
               if (w > 0 && h > 0) rects.push([x, y, w, h]);
@@ -287,6 +304,7 @@ const PAGE_EVAL = {
         }
         return rects;
       }
+
 
       // Foreground media (counts as-is)
       function rectsForMedia() {
@@ -304,21 +322,31 @@ const PAGE_EVAL = {
       // Count full CTA hit-area, with per-CTA cap (≤6% of fold)
       function rectsForCTAs() {
         const rects = [];
-        const capArea = 0.06 * foldArea;
-        const btns = Array.from(document.querySelectorAll("a,button,[role='button']")).filter(isVisible);
+        const capArea = 0.06 * (vw * vh); // ≤6% of fold per CTA
+        const minDim = 32;                // allow slightly smaller than 44px
+        const minArea = 0.015 * (vw * vh);
+      
+        const btns = Array.from(document.querySelectorAll("a,button,[role='button']"))
+          .filter(isVisible)
+          .filter((el) => hasCta(el)); // <- only elements that look like CTAs
+      
         for (const el of btns) {
           const r = el.getBoundingClientRect();
+          // ignore off-fold and chat bubbles
           const isChatBubble = (r.width <= 64 && r.height <= 64 && r.right >= vw - 80 && r.bottom >= vh - 140);
           if (isChatBubble) continue;
           if (r.bottom <= 0 || r.top >= vh) continue;
-          if (Math.min(r.width, r.height) < 44) continue;
-
+      
+          // clamp to fold
           let x = clamp(r.left, 0, vw), y = clamp(r.top, 0, vh);
           let w = clamp(r.right, 0, vw) - x, h = clamp(r.bottom, 0, vh) - y;
           if (w <= 0 || h <= 0) continue;
-
-          // Cap contribution
+      
+          // skip tiny chips unless area is meaningful
           const area = w * h;
+          if (Math.min(w, h) < minDim && area < minArea) continue;
+      
+          // cap contribution
           if (area > capArea) {
             const scale = Math.sqrt(capArea / area);
             const nw = Math.max(1, w * scale), nh = Math.max(1, h * scale);
@@ -332,6 +360,7 @@ const PAGE_EVAL = {
         }
         return rects;
       }
+
 
       // Large, non-repeating hero backgrounds (raster preferred; SVG allowed in a narrow case)
       function rectsForHeroBackgrounds() {
@@ -404,24 +433,47 @@ const PAGE_EVAL = {
         return Array.from(covered.values()).sort((a, b) => a - b);
       }
 
-      function ctaDetection() {
-        const PHRASES = [
-          "get started","start now","buy","add to cart","book","sign up","log in","subscribe","try","contact","learn more",
-          "commencer","acheter","ajouter au panier","réserver","s'inscrire","se connecter","essayer","nous contacter","en savoir plus",
-          "jetzt starten","kaufen","in den warenkorb","buchen","registrieren","anmelden","testen","kontakt","mehr erfahren",
-          "empezar","comprar","añadir al carrito","reservar","regístrate","iniciar sesión","probar","contacto","más información",
-          "começar","comprar","adicionar ao carrinho","reservar","inscrever-se","entrar","experimentar","contato","saiba mais",
-          "inizia","compra","aggiungi al carrello","prenota","iscriviti","accedi","prova","contattaci","scopri di più"
-        ];
-        function hasCta(el) { return PHRASES.some((p) => ((el.innerText || "").toLowerCase()).includes(p)); }
-        const candidates = Array.from(document.querySelectorAll("a,button,[role='button']")).filter(isVisible);
-        let firstInFold = false;
-        for (const el of candidates) {
-          const r = el.getBoundingClientRect();
-          if (r.top >= 0 && r.bottom <= window.innerHeight) { if (hasCta(el)) { firstInFold = true; break; } }
+      function norm(t) {
+          return (t || "")
+            .toLowerCase()
+            .normalize("NFD").replace(/[\u0300-\u036f]/g, ""); // strip accents
         }
-        return { firstCtaInFold: firstInFold };
-      }
+        const CTA_PHRASES = [
+          // EN
+          "get started","start now","request a demo","book a demo","request demo",
+          "buy","add to cart","sign up","log in","subscribe","try","contact","learn more",
+          // FR
+          "demander une demo","demander une démo","essayer","nous contacter","en savoir plus",
+          "commencer","acheter","ajouter au panier","reserver","réserver","s'inscrire","se connecter",
+          // DE
+          "demo anfordern","jetzt starten","kaufen","in den warenkorb","buchen","registrieren","anmelden","testen","kontakt","mehr erfahren",
+          // ES
+          "solicitar una demo","empezar","comprar","añadir al carrito","reservar","regístrate","iniciar sesion","iniciar sesión","probar","contacto","mas informacion","más información",
+          // PT
+          "solicitar uma demo","comecar","começar","comprar","adicionar ao carrinho","reservar","inscrever-se","entrar","experimentar","contato","saiba mais",
+          // IT
+          "richiedi una demo","inizia","compra","aggiungi al carrello","prenota","iscriviti","accedi","prova","contattaci","scopri di piu","scopri di più"
+        ];
+        function hasCta(el) {
+          const t = norm(el.innerText || "");
+          if (t.length < 3) return false;
+          return CTA_PHRASES.some(p => t.includes(p));
+        }
+
+
+        function ctaDetection() {
+          const candidates = Array.from(document.querySelectorAll("a,button,[role='button']"))
+            .filter(isVisible)
+            .filter(el => hasCta(el));
+        
+          let firstInFold = false;
+          for (const el of candidates) {
+            const r = el.getBoundingClientRect();
+            if (r.top >= 0 && r.bottom <= window.innerHeight) { firstInFold = true; break; }
+          }
+          return { firstCtaInFold: firstInFold };
+        }
+
 
       function foldFontStats() {
         const els = Array.from(document.querySelectorAll("body *")).filter(isVisible);
