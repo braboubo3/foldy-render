@@ -1,19 +1,20 @@
-// Foldy — Render Service (stabilized: overlay-fix, faster heatmap, tighter text, CTA boxes, safer hero BG)
+// Foldy — Render Service (stabilized: watchdogs, CSP-safe heatmap, overlay fix, CTA + text heuristics)
 /* eslint-disable no-console */
 import express from "express";
 import { chromium } from "playwright";
 import dns from "node:dns/promises";
 import net from "node:net";
 
-
-
 const PORT = process.env.PORT || 3000;
 const RENDER_TOKEN = process.env.RENDER_TOKEN;
-const HARD_TIMEOUT_MS   = parseInt(process.env.RENDER_HARD_TIMEOUT_MS   || "45000", 10);
-const DNS_TIMEOUT_MS    = parseInt(process.env.RENDER_DNS_TIMEOUT_MS    || "4000", 10);
-const SHOT_TIMEOUT_MS   = parseInt(process.env.RENDER_SHOT_TIMEOUT_MS   || "15000", 10); // was 8000
-const HEATMAP_TIMEOUT_MS= parseInt(process.env.RENDER_HEATMAP_TIMEOUT_MS|| "10000", 10);
-const SNAP_TIMEOUT_MS   = parseInt(process.env.RENDER_SNAP_TIMEOUT_MS   || "6000", 10);  // for debugOverlay asSeen
+
+// Timeouts (tune via env on Render)
+const HARD_TIMEOUT_MS    = parseInt(process.env.RENDER_HARD_TIMEOUT_MS    || "45000", 10);
+const DNS_TIMEOUT_MS     = parseInt(process.env.RENDER_DNS_TIMEOUT_MS     || "4000", 10);
+const SHOT_TIMEOUT_MS    = parseInt(process.env.RENDER_SHOT_TIMEOUT_MS    || "15000", 10);
+const HEATMAP_TIMEOUT_MS = parseInt(process.env.RENDER_HEATMAP_TIMEOUT_MS || "10000", 10);
+const SNAP_TIMEOUT_MS    = parseInt(process.env.RENDER_SNAP_TIMEOUT_MS    || "6000", 10);
+
 if (!RENDER_TOKEN) {
   console.error("Missing RENDER_TOKEN");
   process.exit(1);
@@ -54,7 +55,7 @@ function ipInCidr(ip, cidr) {
   return (bufToInt(ipBuf) & mask) === (bufToInt(rangeBuf) & mask);
 }
 
-// Generic watchdog for async steps
+// Generic watchdog
 function withTimeout(promise, ms, label = "operation") {
   let timer;
   const timeout = new Promise((_, reject) => {
@@ -64,10 +65,7 @@ function withTimeout(promise, ms, label = "operation") {
       reject(err);
     }, ms);
   });
-  return Promise.race([
-    promise.finally(() => clearTimeout(timer)),
-    timeout,
-  ]);
+  return Promise.race([promise.finally(() => clearTimeout(timer)), timeout]);
 }
 
 async function resolve4WithTimeout(hostname, ms) {
@@ -84,19 +82,11 @@ async function assertUrlAllowed(raw) {
   if (hostLower === "localhost" || hostLower === "127.0.0.1" || hostLower === "::1") {
     throw Object.assign(new Error("Localhost blocked"), { status: 422 });
   }
-
   let addrs = [];
-  try {
-    addrs = await resolve4WithTimeout(u.hostname, DNS_TIMEOUT_MS);
-  } catch {
-    // DNS failed or timed out → proceed without addresses (still blocks if resolution returns private IPs)
-    addrs = [];
-  }
+  try { addrs = await resolve4WithTimeout(u.hostname, DNS_TIMEOUT_MS); } catch { addrs = []; }
   for (const ip of addrs) {
     for (const cidr of PRIVATE_CIDRS) {
-      if (ipInCidr(ip, cidr)) {
-        throw Object.assign(new Error("Private network blocked"), { status: 422 });
-      }
+      if (ipInCidr(ip, cidr)) throw Object.assign(new Error("Private network blocked"), { status: 422 });
     }
   }
   return u.toString();
@@ -178,7 +168,7 @@ async function getBrowser() {
 const now = () => Date.now();
 function ms(start, end) { return Math.max(0, Math.round(end - start)); }
 
-/** ---------- Page setup: block heavy 3P; stop animations ---------- **/
+/** ---------- Page setup ---------- **/
 const ABORT_PATTERNS = [
   "googletagmanager.com","google-analytics.com","doubleclick.net","facebook.net",
   "hotjar.com","fullstory.com","segment.io","mixpanel.com","amplitude.com",
@@ -204,16 +194,15 @@ async function prepPage(page) {
   page.setDefaultNavigationTimeout(15000);
 }
 
-/** ---------- In-page auditing code ---------- **/
+/** ---------- In-page auditing ---------- **/
 const PAGE_EVAL = {
-  async asSeen(page) { return page.screenshot({ type: "png", fullPage: false }); },
+  async asSeen(page) { return page.screenshot({ type: "png", fullPage: false, timeout: SNAP_TIMEOUT_MS - 500 }); },
 
-  // Pre-hide: find overlay candidates & tag them; compute coverage stats
+  // Pre-hide overlays
   async preHideOverlays(page) {
     return page.evaluate(() => {
       const vw = window.innerWidth, vh = window.innerHeight;
       const foldArea = vw * vh;
-
       function isVisible(el) {
         const r = el.getBoundingClientRect();
         const style = getComputedStyle(el);
@@ -221,7 +210,6 @@ const PAGE_EVAL = {
         if (r.width <= 0 || r.height <= 0) return false;
         return r.top < vh && r.left < vw && r.bottom > 0 && r.right > 0;
       }
-
       const candidates = Array.from(document.querySelectorAll("*")).filter((el) => {
         const cs = getComputedStyle(el);
         if (!(cs.position === "fixed" || cs.position === "sticky")) return false;
@@ -230,23 +218,24 @@ const PAGE_EVAL = {
         const inFoldWidth = Math.max(0, Math.min(r.right, vw) - Math.max(r.left, 0));
         const inFoldHeight = Math.max(0, Math.min(r.bottom, vh) - Math.max(r.top, 0));
         const inFoldArea = inFoldWidth * inFoldHeight;
+
         const txt = (el.innerText || "").toLowerCase();
         const looksLikeCookie =
           txt.includes("cookie") || txt.includes("consent") ||
           txt.includes("accept all") || txt.includes("agree");
+
         // bottom bar must be wide and contain at least two actionable items
         const btnCount = el.querySelectorAll("button,a,[role='button']").length;
         const wideBar = (inFoldWidth / vw) >= 0.6;
         const likelyBar = (r.height >= 48 && r.top >= vh - 220 && wideBar && btnCount >= 2);
 
-        // keep: explicit cookie/consent, or large fixed overlays
         if (looksLikeCookie) return true;
         if (likelyBar) return true;
-        // otherwise require a larger area to avoid tagging tiny pills
+        // otherwise require larger area to avoid tagging tiny pills
         return inFoldArea / foldArea >= 0.20;
       });
 
-      // Tag actual overlay nodes so we can hide only them
+      // Tag actual overlay nodes so we hide only them
       candidates.forEach((el) => { try { el.setAttribute("data-foldy-overlay-candidate", "1"); } catch {} });
 
       const overlayRects = candidates.map((el) => {
@@ -269,12 +258,12 @@ const PAGE_EVAL = {
     });
   },
 
-  // Hide ONLY the tagged overlays
+  // Hide ONLY tagged overlays
   async hideOverlays(page) {
     await page.addStyleTag({ content: `[data-foldy-overlay-candidate="1"]{display:none!important}` });
   },
 
-  // Clean audit (after hide)
+  // Compute coverage + metrics
   async cleanAudit(page) {
     return page.evaluate(() => {
       const vw = window.innerWidth, vh = window.innerHeight;
@@ -295,118 +284,143 @@ const PAGE_EVAL = {
         return true;
       }
 
-      // Text: per-line fragments (tighter than one giant box) + 1px erosion
-function rectsForTextNodes() {
-  const rects = [];
-  const vw = window.innerWidth, vh = window.innerHeight;
-
-  const walker = document.createTreeWalker(
-    document.body, NodeFilter.SHOW_TEXT,
-    { acceptNode: (n) => {
-        if (!n.nodeValue || !n.nodeValue.trim()) return NodeFilter.FILTER_REJECT;
-        const el = n.parentElement;
-        if (!el || !isVisible(el)) return NodeFilter.FILTER_REJECT;
-        const fs = parseFloat(getComputedStyle(el).fontSize || "0");
-        if (fs < 8) return NodeFilter.FILTER_REJECT;
-        return NodeFilter.FILTER_ACCEPT;
+      // --- helpers for CTA detection ---
+      function norm(t) {
+        return (t || "")
+          .toLowerCase()
+          .normalize("NFD").replace(/[\u0300-\u036f]/g, "");
       }
-    }
-  );
-
-  let node;
-  while ((node = walker.nextNode())) {
-    const el = node.parentElement;
-    const fs = parseFloat(getComputedStyle(el).fontSize || "0");
-    const range = document.createRange();
-    try {
-      range.selectNodeContents(node);
-      const list = range.getClientRects(); // per-line
-      for (const r of list) {
-        let x = Math.max(0, Math.min(r.left, vw));
-        let y = Math.max(0, Math.min(r.top, vh));
-        let w = Math.max(0, Math.min(r.right, vw) - x);
-        let h = Math.max(0, Math.min(r.bottom, vh) - y);
-        if (w <= 1 || h <= 6) continue;
-
-        // shrink vertical paint to ~ font-size height
-        const targetH = Math.min(h, Math.max(8, fs * 1.3));
-        const dy = (h - targetH) / 2;
-        y = Math.max(0, Math.min(y + dy, vh));
-        h = Math.max(0, Math.min(targetH, vh - y));
-
-        // erode 1px to avoid gutters
-        x = Math.min(x + 1, vw); y = Math.min(y + 1, vh);
-        w = Math.max(0, w - 2);  h = Math.max(0, h - 2);
-
-        if (w > 0 && h > 0) rects.push([x, y, w, h]);
+      const CTA_PHRASES = [
+        "get started","start now","request a demo","book a demo","request demo",
+        "buy","add to cart","sign up","log in","subscribe","try","contact","learn more",
+        "demander une demo","demander une démo","essayer","nous contacter","en savoir plus",
+        "commencer","acheter","ajouter au panier","reserver","réserver","s'inscrire","se connecter",
+        "demo anfordern","jetzt starten","kaufen","in den warenkorb","buchen","registrieren","anmelden","testen","kontakt","mehr erfahren",
+        "solicitar una demo","empezar","comprar","añadir al carrito","reservar","regístrate","iniciar sesion","iniciar sesión","probar","contacto","mas informacion","más información",
+        "solicitar uma demo","comecar","começar","comprar","adicionar ao carrinho","reservar","inscrever-se","entrar","experimentar","contato","saiba mais",
+        "richiedi una demo","inizia","compra","aggiungi al carrello","prenota","iscriviti","accedi","prova","contattaci","scopri di piu","scopri di più"
+      ];
+      function hasCtaText(el) {
+        const t = norm(el.innerText || "");
+        return t.length > 2 && CTA_PHRASES.some(p => t.includes(p));
       }
-    } catch {}
-    range.detach?.();
-  }
-  return rects;
-}
+      function looksLikeButton(el) {
+        const role = (el.getAttribute("role") || "").toLowerCase();
+        const type = (el.getAttribute("type") || "").toLowerCase();
+        const cls = (el.className || "").toString().toLowerCase();
+        const id = (el.id || "").toLowerCase();
+        const classHit = /\b(btn|button|cta|primary|pill|calltoaction|call-to-action)\b/.test(cls)
+                      || /\b(btn|button|cta|primary|pill)\b/.test(id)
+                      || /\b(btn-|button-|cta-|primary-)/.test(cls);
+        const roleHit  = role === "button";
+        const typeHit  = type === "button" || type === "submit";
+        const cs = getComputedStyle(el);
+        const hasBg = cs.backgroundColor && cs.backgroundColor !== "rgba(0, 0, 0, 0)" && cs.backgroundColor !== "transparent";
+        const radius = ["borderTopLeftRadius","borderTopRightRadius","borderBottomLeftRadius","borderBottomRightRadius"]
+          .map(k => parseFloat(cs[k] || "0")).reduce((a,b)=>a+b,0);
+        const rounded = radius >= 12;
+        return classHit || roleHit || typeHit || (hasBg && rounded);
+      }
 
+      // --- Rect collectors ---
+      function rectsForTextNodes() {
+        const rects = [];
+        const walker = document.createTreeWalker(
+          document.body, NodeFilter.SHOW_TEXT,
+          { acceptNode: (n) => {
+              if (!n.nodeValue || !n.nodeValue.trim()) return NodeFilter.FILTER_REJECT;
+              const el = n.parentElement;
+              if (!el || !isVisible(el)) return NodeFilter.FILTER_REJECT;
+              const fs = parseFloat(getComputedStyle(el).fontSize || "0");
+              if (fs < 8) return NodeFilter.FILTER_REJECT;
+              return NodeFilter.FILTER_ACCEPT;
+            }
+          }
+        );
+        let node;
+        while ((node = walker.nextNode())) {
+          const el = node.parentElement;
+          const fs = parseFloat(getComputedStyle(el).fontSize || "0");
+          const range = document.createRange();
+          try {
+            range.selectNodeContents(node);
+            const list = range.getClientRects(); // per-line
+            for (const r of list) {
+              let x = Math.max(0, Math.min(r.left, vw));
+              let y = Math.max(0, Math.min(r.top, vh));
+              let w = Math.max(0, Math.min(r.right, vw) - x);
+              let h = Math.max(0, Math.min(r.bottom, vh) - y);
+              if (w <= 1 || h <= 6) continue;
 
+              const targetH = Math.min(h, Math.max(8, fs * 1.3));
+              const dy = (h - targetH) / 2;
+              y = Math.max(0, Math.min(y + dy, vh));
+              h = Math.max(0, Math.min(targetH, vh - y));
 
-      // Foreground media (counts as-is)
+              x = Math.min(x + 1, vw); y = Math.min(y + 1, vh);
+              w = Math.max(0, w - 2);  h = Math.max(0, h - 2);
+
+              if (w > 0 && h > 0) rects.push([x, y, w, h]);
+            }
+          } catch {}
+          range.detach?.();
+        }
+        return rects;
+      }
+
       function rectsForMedia() {
         const rects = [];
         document.querySelectorAll("img,video,svg,canvas").forEach((el) => {
           if (!isVisible(el)) return;
           const r = el.getBoundingClientRect();
-          const x = clamp(r.left, 0, vw), y = clamp(r.top, 0, vh);
-          const w = clamp(r.right, 0, vw) - x, h = clamp(r.bottom, 0, vh) - y;
+          const x = Math.max(0, Math.min(r.left, vw));
+          const y = Math.max(0, Math.min(r.top, vh));
+          const w = Math.max(0, Math.min(r.right, vw) - x);
+          const h = Math.max(0, Math.min(r.bottom, vh) - y);
           if (w > 0 && h > 0) rects.push([x, y, w, h]);
         });
         return rects;
       }
 
-      // Count full CTA hit-area, with per-CTA cap (≤6% of fold)
-function rectsForCTAs() {
-  const rects = [];
-  const capArea = 0.06 * (vw * vh); // ≤6% per CTA
-  const minDim  = 32;               // allow slightly smaller than 44px
-  const minArea = 0.015 * (vw * vh);
+      function rectsForCTAs() {
+        const rects = [];
+        const capArea = 0.06 * foldArea; // ≤6% per CTA
+        const minDim  = 32;
+        const minArea = 0.015 * foldArea;
 
-  const btns = Array.from(document.querySelectorAll("a,button,[role='button']"))
-    .filter(isVisible)
-    .filter((el) => hasCtaText(el) || looksLikeButton(el));
+        const btns = Array.from(document.querySelectorAll("a,button,[role='button']"))
+          .filter(isVisible)
+          .filter((el) => hasCtaText(el) || looksLikeButton(el));
 
-  for (const el of btns) {
-    const r = el.getBoundingClientRect();
+        for (const el of btns) {
+          const r = el.getBoundingClientRect();
+          const isChatBubble = (r.width <= 64 && r.height <= 64 && r.right >= vw - 80 && r.bottom >= vh - 140);
+          if (isChatBubble) continue;
+          if (r.bottom <= 0 || r.top >= vh) continue;
 
-    // ignore off-fold and chat bubbles
-    const isChatBubble = (r.width <= 64 && r.height <= 64 && r.right >= vw - 80 && r.bottom >= vh - 140);
-    if (isChatBubble) continue;
-    if (r.bottom <= 0 || r.top >= vh) continue;
+          let x = Math.max(0, Math.min(r.left, vw));
+          let y = Math.max(0, Math.min(r.top, vh));
+          let w = Math.max(0, Math.min(r.right, vw) - x);
+          let h = Math.max(0, Math.min(r.bottom, vh) - y);
+          if (w <= 0 || h <= 0) continue;
 
-    // clamp to fold
-    let x = clamp(r.left, 0, vw), y = clamp(r.top, 0, vh);
-    let w = clamp(r.right, 0, vw) - x, h = clamp(r.bottom, 0, vh) - y;
-    if (w <= 0 || h <= 0) continue;
+          const area = w * h;
+          if (Math.min(w, h) < minDim && area < minArea) continue;
 
-    // skip tiny chips unless they still have meaningful area
-    const area = w * h;
-    if (Math.min(w, h) < minDim && area < minArea) continue;
+          if (area > capArea) {
+            const scale = Math.sqrt(capArea / area);
+            const nw = Math.max(1, w * scale), nh = Math.max(1, h * scale);
+            const cx = x + w / 2, cy = y + h / 2;
+            x = Math.max(0, Math.min(cx - nw / 2, vw));
+            y = Math.max(0, Math.min(cy - nh / 2, vh));
+            w = Math.max(0, Math.min(x + nw, vw) - x);
+            h = Math.max(0, Math.min(y + nh, vh) - y);
+          }
+          rects.push([x, y, w, h]);
+        }
+        return rects;
+      }
 
-    // cap contribution
-    if (area > capArea) {
-      const scale = Math.sqrt(capArea / area);
-      const nw = Math.max(1, w * scale), nh = Math.max(1, h * scale);
-      const cx = x + w / 2, cy = y + h / 2;
-      x = clamp(cx - nw / 2, 0, vw);
-      y = clamp(cy - nh / 2, 0, vh);
-      w = clamp(x + nw, 0, vw) - x;
-      h = clamp(y + nh, 0, vh) - y;
-    }
-    rects.push([x, y, w, h]);
-  }
-  return rects;
-}
-
-
-
-      // Large, non-repeating hero backgrounds (raster preferred; SVG allowed in a narrow case)
       function rectsForHeroBackgrounds() {
         const rects = [];
         const els = Array.from(document.querySelectorAll("body *"));
@@ -415,48 +429,47 @@ function rectsForCTAs() {
           const cs = getComputedStyle(el);
           const bg = cs.backgroundImage;
           if (!bg || bg === "none") return;
-      
-          // Ignore gradients and ANY SVG background (decorative patterns like poslik)
           if (/gradient\(/i.test(bg)) return;
+
           const urls = bg.match(/url\((?:[^)(]|\((?:[^)(]+|\([^)(]*\))*\))*\)/g) || [];
-          if (urls.length !== 1) return; // hero is single image layer only
+          if (urls.length !== 1) return;
           const url0 = urls[0].replace(/^url\(["']?/, "").replace(/["']?\)$/, "");
+
           const isRaster = /\.(jpe?g|png|webp|avif)(\?|$)/i.test(url0) ||
                            /^data:image\/(jpeg|jpg|png|webp|avif)/i.test(url0);
           const isSvg = /\.svg(\?|$)/i.test(url0) || /^data:image\/svg\+xml/i.test(url0);
-          if (!isRaster || isSvg) return; // <- raster only
-      
-          // large + non-repeating
+          if (!isRaster || isSvg) return; // raster only (ignore SVG backgrounds)
+
           const nonRepeating = /no-repeat/i.test(cs.backgroundRepeat || "");
           const large = /cover|contain/i.test(cs.backgroundSize || "");
           if (!nonRepeating && !large) return;
-      
-          const vw = window.innerWidth, vh = window.innerHeight;
+
           const r = el.getBoundingClientRect();
-          const x = clamp(r.left, 0, vw), y = clamp(r.top, 0, vh);
-          const w = clamp(r.right, 0, vw) - x, h = clamp(r.bottom, 0, vh) - y;
+          const x = Math.max(0, Math.min(r.left, vw));
+          const y = Math.max(0, Math.min(r.top, vh));
+          const w = Math.max(0, Math.min(r.right, vw) - x);
+          const h = Math.max(0, Math.min(r.bottom, vh) - y);
           if (w <= 0 || h <= 0) return;
-      
-          const foldArea = vw * vh;
+
           const area = w * h;
           const bigEnough = (area / foldArea >= 0.45) && (w >= 0.70 * vw) && (h >= 0.35 * vh);
           if (!bigEnough) return;
-      
-          // Avoid double counting if a big foreground media exists inside
+
           const hasBigMediaChild = Array.from(el.querySelectorAll("img,video,svg,canvas")).some((child) => {
             if (!isVisible(child)) return false;
             const cr = child.getBoundingClientRect();
-            const cx = clamp(cr.left, 0, vw), cy = clamp(cr.top, 0, vh);
-            const cw = clamp(cr.right, 0, vw) - cx, ch = clamp(cr.bottom, 0, vh) - cy;
+            const cx = Math.max(0, Math.min(cr.left, vw));
+            const cy = Math.max(0, Math.min(cr.top, vh));
+            const cw = Math.max(0, Math.min(cr.right, vw) - cx);
+            const ch = Math.max(0, Math.min(cr.bottom, vh) - cy);
             return (cw * ch) / foldArea >= 0.20;
           });
           if (hasBigMediaChild) return;
-      
+
           rects.push([x, y, w, h]);
         });
         return rects;
       }
-
 
       function rasterizeToGrid(rects) {
         const covered = new Set();
@@ -474,64 +487,6 @@ function rectsForCTAs() {
         return Array.from(covered.values()).sort((a, b) => a - b);
       }
 
-      function norm(t) {
-        return (t || "")
-          .toLowerCase()
-          .normalize("NFD").replace(/[\u0300-\u036f]/g, ""); // strip accents
-      }
-      
-      const CTA_PHRASES = [
-        // EN
-        "get started","start now","request a demo","book a demo","request demo",
-        "buy","add to cart","sign up","log in","subscribe","try","contact","learn more",
-        // FR
-        "demander une demo","demander une démo","essayer","nous contacter","en savoir plus",
-        "commencer","acheter","ajouter au panier","reserver","réserver","s'inscrire","se connecter",
-        // DE
-        "demo anfordern","jetzt starten","kaufen","in den warenkorb","buchen","registrieren","anmelden","testen","kontakt","mehr erfahren",
-        // ES
-        "solicitar una demo","empezar","comprar","añadir al carrito","reservar",
-        "regístrate","iniciar sesion","iniciar sesión","probar","contacto","mas informacion","más información",
-        // PT
-        "solicitar uma demo","comecar","começar","comprar","adicionar ao carrinho","reservar",
-        "inscrever-se","entrar","experimentar","contato","saiba mais",
-        // IT
-        "richiedi una demo","inizia","compra","aggiungi al carrello","prenota","iscriviti","accedi","prova","contattaci","scopri di piu","scopri di più"
-      ];
-      
-      function hasCtaText(el) {
-        const t = norm(el.innerText || "");
-        return t.length > 2 && CTA_PHRASES.some(p => t.includes(p));
-      }
-      
-      // Class/style/role heuristics for buttons (covers “COMPTE PRO” etc.)
-      function looksLikeButton(el) {
-        const role = (el.getAttribute("role") || "").toLowerCase();
-        const type = (el.getAttribute("type") || "").toLowerCase();
-        const cls = (el.className || "").toString().toLowerCase();
-        const id = (el.id || "").toLowerCase();
-      
-        const classHit = /\b(btn|button|cta|primary|pill|calltoaction|call-to-action)\b/.test(cls)
-                      || /\b(btn|button|cta|primary|pill)\b/.test(id)
-                      || /\b(btn-|button-|cta-|primary-)/.test(cls);
-      
-        const roleHit  = role === "button";
-        const typeHit  = type === "button" || type === "submit";
-      
-        // visual hint: obvious background and some radius
-        const cs = getComputedStyle(el);
-        const hasBg = cs.backgroundColor && cs.backgroundColor !== "rgba(0, 0, 0, 0)" && cs.backgroundColor !== "transparent";
-        const radius = parseFloat(cs.borderTopLeftRadius || "0") +
-                       parseFloat(cs.borderTopRightRadius || "0") +
-                       parseFloat(cs.borderBottomLeftRadius || "0") +
-                       parseFloat(cs.borderBottomRightRadius || "0");
-        const rounded = radius >= 12;
-      
-        return classHit || roleHit || typeHit || (hasBg && rounded);
-      }
-
-
-      
       function ctaDetection() {
         const candidates = Array.from(document.querySelectorAll("a,button,[role='button']"))
           .filter(isVisible)
@@ -543,8 +498,6 @@ function rectsForCTAs() {
         }
         return { firstCtaInFold: firstInFold };
       }
-
-
 
       function foldFontStats() {
         const els = Array.from(document.querySelectorAll("body *")).filter(isVisible);
@@ -581,11 +534,10 @@ function rectsForCTAs() {
       const coveredCells = rasterizeToGrid(allRects);
 
       const foldCoveragePct = Math.round((coveredCells.length / (GRID_ROWS * GRID_COLS)) * 100);
-      const paintedCoveragePct = 100; // reserved/debug
+      const paintedCoveragePct = 100; // reserved
       const { firstCtaInFold } = ctaDetection();
       const { minFontPx, maxFontPx } = foldFontStats();
       const smallTaps = smallTapTargetsCount();
-      const visibleFoldCoveragePct = foldCoveragePct;
 
       const usesSafeAreaCSS = (() => {
         const sheets = Array.from(document.querySelectorAll("style"));
@@ -596,7 +548,7 @@ function rectsForCTAs() {
         ux: {
           firstCtaInFold,
           foldCoveragePct,
-          visibleFoldCoveragePct,
+          visibleFoldCoveragePct: foldCoveragePct,
           paintedCoveragePct,
           maxFontPx,
           minFontPx,
@@ -617,31 +569,23 @@ function rectsForCTAs() {
     });
   },
 
-  // Draw heatmap overlay (single shot) and return PNG
+  // CSP-safe, lightweight heatmap overlay
   async heatmapPng(page, debugRects) {
-    // Build & draw entirely via page.evaluate (no <script> injection / CSP issues)
     await page.evaluate((debugRects) => {
-      // create canvas
       const prev = document.getElementById("_foldy_heatmap");
       if (prev) prev.remove();
       const c = document.createElement("canvas");
       c.id = "_foldy_heatmap";
       c.width = window.innerWidth;
       c.height = window.innerHeight;
-      Object.assign(c.style, {
-        position: "fixed",
-        left: "0px",
-        top: "0px",
-        zIndex: "9999999",
-        pointerEvents: "none",
-      });
+      Object.assign(c.style, { position: "fixed", left: "0px", top: "0px", zIndex: "9999999", pointerEvents: "none" });
       document.body.appendChild(c);
-  
+
       const ctx = c.getContext("2d");
       const w = c.width, h = c.height;
       const cols = debugRects.cols, rows = debugRects.rows;
       const cellW = w / cols, cellH = h / rows;
-  
+
       // grid fill (what we count)
       ctx.fillStyle = "rgba(0,255,0,0.12)";
       for (let i = 0; i < debugRects.coveredCells.length; i++) {
@@ -650,11 +594,10 @@ function rectsForCTAs() {
         const gx = idx % cols;
         ctx.fillRect(gx * cellW, gy * cellH, cellW, cellH);
       }
-  
-      // Draw strokes (keep it light; caps avoid pathological pages)
+
+      // strokes (limited to prevent slow draws)
       const MAX_STROKES = 2000;
       let drawn = 0;
-  
       function drawRects(rects, stroke) {
         if (!rects) return;
         ctx.strokeStyle = stroke;
@@ -665,25 +608,23 @@ function rectsForCTAs() {
         }
         drawn += n;
       }
-  
-      drawRects(debugRects.glyphRects,   "rgba(0,128,0,0.7)");     // text
-      drawRects(debugRects.mediaRects,   "rgba(0,0,255,0.7)");     // media
-      drawRects(debugRects.ctaRects,     "rgba(128,0,128,0.85)");  // CTAs
-      drawRects(debugRects.heroBgRects,  "rgba(255,165,0,0.8)");   // hero bg
+      drawRects(debugRects.glyphRects,  "rgba(0,128,0,0.7)");
+      drawRects(debugRects.mediaRects,  "rgba(0,0,255,0.7)");
+      drawRects(debugRects.ctaRects,    "rgba(128,0,128,0.85)");
+      drawRects(debugRects.heroBgRects, "rgba(255,165,0,0.8)");
     }, debugRects);
-  
-    // single screenshot
-    const png = await page.screenshot({ type: "png", fullPage: false });
+
+    const png = await page.screenshot({ type: "png", fullPage: false, timeout: HEATMAP_TIMEOUT_MS - 500 });
     await page.evaluate(() => document.getElementById("_foldy_heatmap")?.remove());
     return png;
-  }
-
+  },
+}; // <-- do not remove; closes PAGE_EVAL
 
 /** ---------- Routes ---------- **/
 app.get("/health", (_req, res) => res.json({ ok: true, up: true }));
 
 app.post("/render", authMiddleware, async (req, res) => {
-  // keep the socket from hanging forever (slightly > HARD_TIMEOUT_MS)
+  // keep sockets from hanging (slightly > HARD_TIMEOUT_MS)
   res.setTimeout(HARD_TIMEOUT_MS + 5000);
   req.setTimeout?.(HARD_TIMEOUT_MS + 5000);
 
@@ -706,11 +647,8 @@ app.post("/render", authMiddleware, async (req, res) => {
     if (!device) return res.status(400).json({ error: "Invalid device" });
 
     const browser = await withTimeout(getBrowser(), 10000, "launch chromium");
-    context = await withTimeout(
-      browser.newContext({ ...device.contextOpts, bypassCSP: true }),
-      8000,
-      "newContext"
-    );
+    // bypassCSP helps debug overlays/heatmap injection
+    context = await withTimeout(browser.newContext({ ...device.contextOpts, bypassCSP: true }), 8000, "newContext");
     page = await withTimeout(context.newPage(), 5000, "newPage");
     await prepPage(page);
 
@@ -720,9 +658,8 @@ app.post("/render", authMiddleware, async (req, res) => {
     await page.waitForLoadState("networkidle", { timeout: 5000 }).catch(() => {});
     const navEnd = now();
 
-    if (debugOverlay) {
-      asSeenPngBuf = await withTimeout(PAGE_EVAL.asSeen(page), SNAP_TIMEOUT_MS, "asSeen screenshot");
-    }
+    if (debugOverlay) asSeenPngBuf = await withTimeout(PAGE_EVAL.asSeen(page), SNAP_TIMEOUT_MS, "asSeen screenshot");
+
     const preStart = now();
     const pre = await withTimeout(PAGE_EVAL.preHideOverlays(page), 7000, "preHideOverlays");
     const preEnd = now();
@@ -745,12 +682,9 @@ app.post("/render", authMiddleware, async (req, res) => {
 
     let heatmapBuf = null;
     if (debugHeatmap) {
-      heatmapBuf = await withTimeout(
-        PAGE_EVAL.heatmapPng(page, rectsForDebug),
-        HEATMAP_TIMEOUT_MS,
-        "heatmapPng"
-      );
+      heatmapBuf = await withTimeout(PAGE_EVAL.heatmapPng(page, rectsForDebug), HEATMAP_TIMEOUT_MS, "heatmapPng");
     }
+
     const deviceMeta = {
       viewport: device.contextOpts.viewport,
       dpr: device.contextOpts.deviceScaleFactor,
@@ -758,12 +692,10 @@ app.post("/render", authMiddleware, async (req, res) => {
       label: device.label,
     };
 
-    // add timestamps up top
     const nowDate = new Date();
     const payload = {
       ts_ms: nowDate.getTime(),
       ts_iso: nowDate.toISOString(),
-
       device: deviceKey,
       deviceMeta,
       pngBase64: cleanPngBuf.toString("base64"),
@@ -798,7 +730,6 @@ app.post("/render", authMiddleware, async (req, res) => {
     try { await context?.close?.(); } catch {}
   }
 });
-
 
 /** ---------- Boot ---------- **/
 let server;
