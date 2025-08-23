@@ -277,14 +277,17 @@ const PAGE_EVAL = {
       function clamp(n, lo, hi) { return Math.max(lo, Math.min(hi, n)); }
       function isVisible(el) {
         const cs = getComputedStyle(el);
-        // Skip hidden/none/fully transparent elements
+        // hidden or collapsed
         if (cs.visibility === "hidden" || cs.display === "none") return false;
+        // effectively invisible (helps remove ghost text in translucent layers)
         if (parseFloat(cs.opacity || "1") < 0.05) return false;
+      
         const r = el.getBoundingClientRect();
         if (r.width <= 0 || r.height <= 0) return false;
         if (r.bottom <= 0 || r.right <= 0 || r.top >= vh || r.left >= vw) return false;
         return true;
       }
+
 
       // --- helpers for CTA detection ---
       function norm(t) {
@@ -329,21 +332,41 @@ const PAGE_EVAL = {
         const rects = [];
         const vw = window.innerWidth, vh = window.innerHeight;
       
-        // helper: alpha from "rgb/rgba()"
+        // Alpha from rgb/rgba()
         const alphaOf = (cssColor) => {
           const m = /\brgba?\(\s*([\d.]+)\s*,\s*([\d.]+)\s*,\s*([\d.]+)(?:\s*,\s*([\d.]+))?\s*\)/i.exec(cssColor || "");
           return m ? (m[4] === undefined ? 1 : parseFloat(m[4])) : 1;
         };
+        // Treat ALL space-likes as whitespace (incl. nbsp/hair/narrow/zero-width)
+        const WS_CHAR_RE = /^[\s\u00A0\u1680\u180E\u2000-\u200B\u202F\u205F\u3000\uFEFF]$/;
+      
+        // Is the character at (x,y) whitespace?
+        function isWhitespaceAt(x, y) {
+          const caretPos = (document.caretPositionFromPoint && document.caretPositionFromPoint(x, y)) || null;
+          if (caretPos && caretPos.offsetNode && caretPos.offsetNode.nodeType === Node.TEXT_NODE) {
+            const s = caretPos.offsetNode.nodeValue || "";
+            const i = Math.min(Math.max(caretPos.offset, 0), Math.max(0, s.length - 1));
+            return WS_CHAR_RE.test(s[i] || "");
+          }
+          const caretRange = (document.caretRangeFromPoint && document.caretRangeFromPoint(x, y)) || null;
+          if (caretRange && caretRange.startContainer && caretRange.startContainer.nodeType === Node.TEXT_NODE) {
+            const s = caretRange.startContainer.nodeValue || "";
+            const i = Math.min(Math.max(caretRange.startOffset, 0), Math.max(0, s.length - 1));
+            return WS_CHAR_RE.test(s[i] || "");
+          }
+          return false;
+        }
       
         const walker = document.createTreeWalker(
           document.body,
           NodeFilter.SHOW_TEXT,
           {
             acceptNode: (n) => {
-              // Remove zero-width & BOM, then check for any non-space
+              // Strip zero-widths & BOM; reject nodes with no real characters left
               const raw = (n.nodeValue || "").replace(/[\u200B\u200C\u200D\uFEFF]/g, "");
-              if (!/[^\s]/.test(raw)) return NodeFilter.FILTER_REJECT;
-      
+              if (!/[^\s\u00A0\u1680\u180E\u2000-\u200B\u202F\u205F\u3000]/.test(raw)) {
+                return NodeFilter.FILTER_REJECT;
+              }
               const el = n.parentElement;
               if (!el || !isVisible(el)) return NodeFilter.FILTER_REJECT;
       
@@ -351,7 +374,7 @@ const PAGE_EVAL = {
               const fs = parseFloat(cs.fontSize || "0");
               if (fs < 8) return NodeFilter.FILTER_REJECT;
       
-              // Transparent text (via color or -webkit-text-fill-color)
+              // Transparent text (color alpha 0 or -webkit-text-fill-color transparent)
               const aColor = alphaOf(cs.color);
               const fill = cs.webkitTextFillColor || "";
               const fillTransparent = fill === "transparent" || /rgba\(\s*0\s*,\s*0\s*,\s*0\s*,\s*0\s*\)/i.test(fill);
@@ -376,6 +399,11 @@ const PAGE_EVAL = {
               let w = Math.max(0, Math.min(r.right, vw) - x);
               let h = Math.max(0, Math.min(r.bottom, vh) - y);
               if (w <= 1 || h <= 6) continue;
+      
+              // Heuristic: if the rect center sits on whitespace, skip (filters leading/trailing space fragments)
+              const cx = Math.min(vw - 1, x + Math.max(1, Math.min(w - 1, fs * 0.6)));
+              const cy = Math.min(vh - 1, y + h / 2);
+              if (isWhitespaceAt(cx, cy)) continue;
       
               // shrink vertical paint to ~font-size height
               const targetH = Math.min(h, Math.max(8, fs * 1.3));
@@ -538,20 +566,40 @@ const PAGE_EVAL = {
         return { minFontPx: Number.isFinite(minFont) ? Math.round(minFont) : 0, maxFontPx: Math.round(maxFont) };
       }
 
-      function smallTapTargetsCount() {
-        const targets = Array.from(document.querySelectorAll("a,button,[role='button'],input[type='button'],input[type='submit']")).filter(isVisible);
+      function smallTapTargets() {
+        const targets = Array.from(document.querySelectorAll(
+          "a,button,[role='button'],input[type='button'],input[type='submit']"
+        )).filter(isVisible);
+      
+        const rects = [];
         let count = 0;
+      
         targets.forEach((el) => {
           const r = el.getBoundingClientRect();
+          // ignore typical chat-bubble area
           const isChatBubble = (r.width <= 64 && r.height <= 64 && r.right >= vw - 80 && r.bottom >= vh - 140);
           if (isChatBubble) return;
-          if (r.top < vh && r.bottom > 0) if (Math.min(r.width, r.height) < 44) count++;
+      
+          if (r.top < vh && r.bottom > 0) {
+            const minSide = Math.min(r.width, r.height);
+            if (minSide < 44) {
+              count++;
+              const x = Math.max(0, Math.min(r.left, vw));
+              const y = Math.max(0, Math.min(r.top, vh));
+              const w = Math.max(0, Math.min(r.right, vw) - x);
+              const h = Math.max(0, Math.min(r.bottom, vh) - y);
+              if (w > 0 && h > 0) rects.push([x, y, w, h]);
+            }
+          }
         });
-        return count;
+      
+        return { count, rects };
       }
 
-      function hasViewportMeta() { return !!document.querySelector('meta[name="viewport"]'); }
 
+      function hasViewportMeta() { return !!document.querySelector('meta[name="viewport"]'); }
+      const small = smallTapTargets();
+      
       const textRects = rectsForTextNodes();
       const mediaRects = rectsForMedia();
       const ctaRects = rectsForCTAs();
@@ -564,7 +612,6 @@ const PAGE_EVAL = {
       const paintedCoveragePct = 100; // reserved
       const { firstCtaInFold } = ctaDetection();
       const { minFontPx, maxFontPx } = foldFontStats();
-      const smallTaps = smallTapTargetsCount();
 
       const usesSafeAreaCSS = (() => {
         const sheets = Array.from(document.querySelectorAll("style"));
@@ -579,7 +626,7 @@ const PAGE_EVAL = {
           paintedCoveragePct,
           maxFontPx,
           minFontPx,
-          smallTapTargets: smallTaps,
+          smallTapTargets: small.count,
           hasViewportMeta: hasViewportMeta(),
           usesSafeAreaCSS,
         },
@@ -588,8 +635,9 @@ const PAGE_EVAL = {
           cols: GRID_COLS,
           glyphRects: textRects.map((r) => r.map((n) => Math.round(n))),
           mediaRects: mediaRects.map((r) => r.map((n) => Math.round(n))),
-          ctaRects: ctaRects.map((r) => r.map((n) => Math.round(n))),
-          heroBgRects: heroRects.map((r) => r.map((n) => Math.round(n))),
+          ctaRects:   ctaRects.map((r) => r.map((n) => Math.round(n))),
+          heroBgRects:heroRects.map((r) => r.map((n) => Math.round(n))),
+          smallTapRects: small.rects.map((r) => r.map((n) => Math.round(n))),
           coveredCells
         }
       };
