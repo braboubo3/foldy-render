@@ -332,14 +332,43 @@ const PAGE_EVAL = {
         const rects = [];
         const vw = window.innerWidth, vh = window.innerHeight;
       
-        // Unicode whitespace set (space, NBSP, hair, narrow, ZW, BOM, etc.)
+        // Unicode whitespace (incl. NBSP, hair, narrow, ZW, BOM…)
         const WS = /[\s\u00A0\u1680\u180E\u2000-\u200B\u202F\u205F\u3000\uFEFF]/;
       
-        // Quick alpha extractor for rgba()
+        // rgba() alpha extractor
         const alphaOf = (cssColor) => {
           const m = /\brgba?\(\s*([\d.]+)\s*,\s*([\d.]+)\s*,\s*([\d.]+)(?:\s*,\s*([\d.]+))?\s*\)/i.exec(cssColor || "");
           return m ? (m[4] === undefined ? 1 : parseFloat(m[4])) : 1;
         };
+      
+        // probe if a rect contains at least one non-whitespace glyph
+        function rectHasGlyph(rect) {
+          const { left, top, width, height } = rect;
+          if (width <= 0 || height <= 0) return false;
+      
+          const samples = Math.min(10, Math.max(3, Math.ceil(width / 8))); // 3..10 points
+          const y = Math.min(vh - 1, Math.max(0, top + height / 2));
+      
+          for (let i = 0; i < samples; i++) {
+            const x = Math.min(vw - 1, Math.max(0, left + ((i + 0.5) / samples) * width));
+      
+            // Try both APIs for wider browser support
+            const cp = (document.caretPositionFromPoint && document.caretPositionFromPoint(x, y)) || null;
+            if (cp && cp.offsetNode && cp.offsetNode.nodeType === Node.TEXT_NODE) {
+              const s = cp.offsetNode.nodeValue || "";
+              const k = Math.min(Math.max(cp.offset, 0), Math.max(0, s.length - 1));
+              if (s[k] && !WS.test(s[k])) return true;
+            }
+      
+            const cr = (document.caretRangeFromPoint && document.caretRangeFromPoint(x, y)) || null;
+            if (cr && cr.startContainer && cr.startContainer.nodeType === Node.TEXT_NODE) {
+              const s = cr.startContainer.nodeValue || "";
+              const k = Math.min(Math.max(cr.startOffset, 0), Math.max(0, s.length - 1));
+              if (s[k] && !WS.test(s[k])) return true;
+            }
+          }
+          return false; // only spaces seen
+        }
       
         const walker = document.createTreeWalker(
           document.body,
@@ -347,23 +376,23 @@ const PAGE_EVAL = {
           {
             acceptNode: (n) => {
               const s = n.nodeValue || "";
-              // Find first/last non-whitespace char in ORIGINAL string
+              // Trim ends; if entire node becomes whitespace → reject early
               let i = 0, j = s.length - 1;
               while (i <= j && WS.test(s[i])) i++;
               while (j >= i && WS.test(s[j])) j--;
-              if (j < i) return NodeFilter.FILTER_REJECT; // all whitespace
+              if (j < i) return NodeFilter.FILTER_REJECT;
       
               const el = n.parentElement;
               if (!el) return NodeFilter.FILTER_REJECT;
-              // Visible parent + not nearly transparent
+      
               const cs = getComputedStyle(el);
-              if (cs.visibility === "hidden" || cs.display === "none" || parseFloat(cs.opacity || "1") < 0.05) {
-                return NodeFilter.FILTER_REJECT;
-              }
+              if (cs.visibility === "hidden" || cs.display === "none") return NodeFilter.FILTER_REJECT;
+              if (parseFloat(cs.opacity || "1") < 0.05) return NodeFilter.FILTER_REJECT;
+      
               const fs = parseFloat(cs.fontSize || "0");
               if (fs < 8) return NodeFilter.FILTER_REJECT;
       
-              // Transparent text (via color or -webkit-text-fill-color)
+              // transparent text (color alpha 0 or -webkit-text-fill-color transparent)
               const aColor = alphaOf(cs.color);
               const fill = cs.webkitTextFillColor || "";
               const fillTransparent = fill === "transparent" || /rgba\(\s*0\s*,\s*0\s*,\s*0\s*,\s*0\s*\)/i.test(fill);
@@ -376,39 +405,35 @@ const PAGE_EVAL = {
       
         let node;
         while ((node = walker.nextNode())) {
-          const s = node.nodeValue || "";
-          // Trim to the non-whitespace span again (we need indices now)
-          let start = 0, end = s.length - 1;
-          while (start <= end && WS.test(s[start])) start++;
-          while (end >= start && WS.test(s[end])) end--;
-          if (end < start) continue; // safety
+          const el = node.parentElement;
+          const cs = getComputedStyle(el);
+          const fs = parseFloat(cs.fontSize || "0");
       
-          // Build a range for ONLY the non-whitespace subset
+          // Select the WHOLE node first; we’ll validate each rect contains a glyph
           const range = document.createRange();
           try {
-            range.setStart(node, start);
-            range.setEnd(node, end + 1);
-      
-            const el = node.parentElement;
-            const fs = parseFloat(getComputedStyle(el).fontSize || "0");
-      
+            range.selectNodeContents(node);
             const list = range.getClientRects(); // per-line fragments
+      
             for (const r of list) {
+              if (!rectHasGlyph(r)) continue; // <- drop whitespace-only fragments
+      
               let x = Math.max(0, Math.min(r.left, vw));
               let y = Math.max(0, Math.min(r.top, vh));
               let w = Math.max(0, Math.min(r.right, vw) - x);
               let h = Math.max(0, Math.min(r.bottom, vh) - y);
               if (w <= 1 || h <= 6) continue;
       
-              // shrink vertical paint to ~ font-size height
+              // tighten vertically to ~font-size
               const targetH = Math.min(h, Math.max(8, fs * 1.3));
               const dy = (h - targetH) / 2;
               y = Math.max(0, Math.min(y + dy, vh));
               h = Math.max(0, Math.min(targetH, vh - y));
       
-              // erosion to avoid gutters
+              // small erosion to avoid gutters
               x = Math.min(x + 1, vw); y = Math.min(y + 1, vh);
               w = Math.max(0, w - 2);  h = Math.max(0, h - 2);
+      
               if (w > 0 && h > 0) rects.push([x, y, w, h]);
             }
           } catch {}
