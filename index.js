@@ -7,6 +7,8 @@ import net from "node:net";
 
 const PORT = process.env.PORT || 3000;
 const RENDER_TOKEN = process.env.RENDER_TOKEN;
+const HARD_TIMEOUT_MS = parseInt(process.env.RENDER_HARD_TIMEOUT_MS || "45000", 10);
+const DNS_TIMEOUT_MS  = parseInt(process.env.RENDER_DNS_TIMEOUT_MS  || "4000", 10);
 if (!RENDER_TOKEN) {
   console.error("Missing RENDER_TOKEN");
   process.exit(1);
@@ -46,6 +48,27 @@ function ipInCidr(ip, cidr) {
   const mask = ~((1 << (32 - bits)) - 1);
   return (bufToInt(ipBuf) & mask) === (bufToInt(rangeBuf) & mask);
 }
+
+// Generic watchdog for async steps
+function withTimeout(promise, ms, label = "operation") {
+  let timer;
+  const timeout = new Promise((_, reject) => {
+    timer = setTimeout(() => {
+      const err = new Error(`${label} timeout after ${ms}ms`);
+      err.status = 504;
+      reject(err);
+    }, ms);
+  });
+  return Promise.race([
+    promise.finally(() => clearTimeout(timer)),
+    timeout,
+  ]);
+}
+
+async function resolve4WithTimeout(hostname, ms) {
+  return withTimeout(dns.resolve4(hostname, { ttl: false }), ms, `DNS resolve(${hostname})`);
+}
+
 async function assertUrlAllowed(raw) {
   let u;
   try { u = new URL(raw); } catch { throw Object.assign(new Error("Invalid URL"), { status: 400 }); }
@@ -56,11 +79,19 @@ async function assertUrlAllowed(raw) {
   if (hostLower === "localhost" || hostLower === "127.0.0.1" || hostLower === "::1") {
     throw Object.assign(new Error("Localhost blocked"), { status: 422 });
   }
+
   let addrs = [];
-  try { addrs = await dns.resolve4(u.hostname, { ttl: false }); } catch { addrs = []; }
+  try {
+    addrs = await resolve4WithTimeout(u.hostname, DNS_TIMEOUT_MS);
+  } catch {
+    // DNS failed or timed out → proceed without addresses (still blocks if resolution returns private IPs)
+    addrs = [];
+  }
   for (const ip of addrs) {
     for (const cidr of PRIVATE_CIDRS) {
-      if (ipInCidr(ip, cidr)) throw Object.assign(new Error("Private network blocked"), { status: 422 });
+      if (ipInCidr(ip, cidr)) {
+        throw Object.assign(new Error("Private network blocked"), { status: 422 });
+      }
     }
   }
   return u.toString();
@@ -644,6 +675,10 @@ function rectsForCTAs() {
 app.get("/health", (_req, res) => res.json({ ok: true, up: true }));
 
 app.post("/render", authMiddleware, async (req, res) => {
+  // keep the socket from hanging forever (slightly > HARD_TIMEOUT_MS)
+  res.setTimeout(HARD_TIMEOUT_MS + 5000);
+  req.setTimeout?.(HARD_TIMEOUT_MS + 5000);
+
   const t0 = now();
   const q = req.query || {};
   const body = req.body || {};
@@ -651,49 +686,48 @@ app.post("/render", authMiddleware, async (req, res) => {
   const urlRaw = (body.url || q.url || "").trim();
   const deviceKey = (body.device || q.device || "").trim();
   const debugOverlay = parseInt(body.debugOverlay ?? q.debugOverlay ?? 0, 10) === 1;
-  const debugRects = parseInt(body.debugRects ?? q.debugRects ?? 0, 10) === 1;
+  const debugRects   = parseInt(body.debugRects   ?? q.debugRects   ?? 0, 10) === 1;
   const debugHeatmap = parseInt(body.debugHeatmap ?? q.debugHeatmap ?? 0, 10) === 1;
 
   if (!urlRaw || !deviceKey) return res.status(400).json({ error: "Missing url or device" });
 
+  let context = null, page = null;
   try {
     const safeUrl = await assertUrlAllowed(urlRaw);
     const device = deviceFromKey(deviceKey);
     if (!device) return res.status(400).json({ error: "Invalid device" });
 
-    const browser = await getBrowser();
-    const context = await browser.newContext(device.contextOpts);
-    const page = await context.newPage();
+    const browser = await withTimeout(getBrowser(), 10000, "launch chromium");
+    context = await withTimeout(browser.newContext(device.contextOpts), 8000, "newContext");
+    page = await withTimeout(context.newPage(), 5000, "newPage");
     await prepPage(page);
 
     const navStart = now();
     let asSeenPngBuf = null;
-    await page.goto(safeUrl, { waitUntil: "domcontentloaded" });
+    await withTimeout(page.goto(safeUrl, { waitUntil: "domcontentloaded" }), 15000, "page.goto");
     await page.waitForLoadState("networkidle", { timeout: 5000 }).catch(() => {});
     const navEnd = now();
 
-    if (debugOverlay) asSeenPngBuf = await PAGE_EVAL.asSeen(page);
+    if (debugOverlay) asSeenPngBuf = await withTimeout(PAGE_EVAL.asSeen(page), 5000, "asSeen screenshot");
 
     const preStart = now();
-    const pre = await PAGE_EVAL.preHideOverlays(page);
+    const pre = await withTimeout(PAGE_EVAL.preHideOverlays(page), 7000, "preHideOverlays");
     const preEnd = now();
 
     const hideStart = now();
-    await PAGE_EVAL.hideOverlays(page);
+    await withTimeout(PAGE_EVAL.hideOverlays(page), 2000, "hideOverlays");
     const hideEnd = now();
 
     const cleanStart = now();
-    const { ux, debugRects: rectsForDebug } = await PAGE_EVAL.cleanAudit(page);
+    const { ux, debugRects: rectsForDebug } = await withTimeout(PAGE_EVAL.cleanAudit(page), 9000, "cleanAudit");
     const cleanEnd = now();
 
     const shotStart = now();
-    const cleanPngBuf = await page.screenshot({ type: "png", fullPage: false });
+    const cleanPngBuf = await withTimeout(page.screenshot({ type: "png", fullPage: false }), 8000, "clean screenshot");
     const shotEnd = now();
 
     let heatmapBuf = null;
-    if (debugHeatmap) heatmapBuf = await PAGE_EVAL.heatmapPng(page, rectsForDebug);
-
-    await context.close();
+    if (debugHeatmap) heatmapBuf = await withTimeout(PAGE_EVAL.heatmapPng(page, rectsForDebug), 6000, "heatmapPng");
 
     const deviceMeta = {
       viewport: device.contextOpts.viewport,
@@ -702,10 +736,12 @@ app.post("/render", authMiddleware, async (req, res) => {
       label: device.label,
     };
 
+    // add timestamps up top
     const nowDate = new Date();
     const payload = {
       ts_ms: nowDate.getTime(),
       ts_iso: nowDate.toISOString(),
+
       device: deviceKey,
       deviceMeta,
       pngBase64: cleanPngBuf.toString("base64"),
@@ -735,8 +771,12 @@ app.post("/render", authMiddleware, async (req, res) => {
     const status = err?.status || 500;
     console.error("Render error:", err?.message || err);
     return res.status(status).json({ error: String(err?.message || err) });
+  } finally {
+    try { await page?.close?.(); } catch {}
+    try { await context?.close?.(); } catch {}
   }
 });
+
 
 /** ---------- Boot ---------- **/
 let server;
