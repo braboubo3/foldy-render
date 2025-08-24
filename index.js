@@ -8,6 +8,8 @@ import net from "node:net";
 const PORT = process.env.PORT || 3000;
 const RENDER_TOKEN = process.env.RENDER_TOKEN;
 
+const SERVICE_VERSION = process.env.RENDER_VERSION || process.env.COMMIT_SHA || process.env.RENDER_GIT_SHA || "";
+
 // Timeouts (tune via env on Render)
 const HARD_TIMEOUT_MS    = parseInt(process.env.RENDER_HARD_TIMEOUT_MS    || "45000", 10);
 const DNS_TIMEOUT_MS     = parseInt(process.env.RENDER_DNS_TIMEOUT_MS     || "4000", 10);
@@ -54,6 +56,60 @@ function ipInCidr(ip, cidr) {
   const mask = ~((1 << (32 - bits)) - 1);
   return (bufToInt(ipBuf) & mask) === (bufToInt(rangeBuf) & mask);
 }
+
+// ---- SSRF guard: allow only http(s) and block private IPs (v4 & v6) ----
+const PRIVATE_V6 = [
+  "::1/128",   // loopback
+  "fc00::/7",  // unique local
+  "fe80::/10", // link-local
+];
+
+function ipInCidr6(ip, cidr) {
+  if (net.isIP(ip) !== 6) return false;
+  const [base, bitsStr] = cidr.split("/");
+  const bits = parseInt(bitsStr, 10);
+  const ipBlocks = ip.split(":").map(x => x.padStart(4, "0"));
+  const baseBlocks = base.split(":").map(x => x.padStart(4, "0"));
+  let bitsLeft = bits;
+  for (let i = 0; i < 8 && bitsLeft > 0; i++) {
+    const take = Math.min(16, bitsLeft);
+    const ipPart   = parseInt(ipBlocks[i], 16) >>> (16 - take);
+    const basePart = parseInt(baseBlocks[i], 16) >>> (16 - take);
+    if (ipPart !== basePart) return false;
+    bitsLeft -= take;
+  }
+  return true;
+}
+
+async function assertUrlAllowed(raw) {
+  let u;
+  try { u = new URL(raw); } catch { throw Object.assign(new Error("Invalid URL"), { status: 400 }); }
+
+  if (!["http:", "https:"].includes(u.protocol)) {
+    throw Object.assign(new Error("Only http/https allowed"), { status: 422 });
+  }
+
+  const host = (u.hostname || "").toLowerCase();
+  if (host === "localhost" || host === "127.0.0.1" || host === "::1") {
+    throw Object.assign(new Error("Localhost blocked"), { status: 422 });
+  }
+
+  let v4 = [], v6 = [];
+  try { v4 = await withTimeout(dns.resolve4(host), DNS_TIMEOUT_MS, `DNS A(${host})`); } catch {}
+  try { v6 = await withTimeout(dns.resolve6(host), DNS_TIMEOUT_MS, `DNS AAAA(${host})`); } catch {}
+
+  for (const ip of v4) for (const cidr of PRIVATE_CIDRS)
+    if (ipInCidr(ip, cidr)) throw Object.assign(new Error("Private network blocked (v4)"), { status: 422 });
+
+  for (const ip of v6) {
+    if (ip === "::1") throw Object.assign(new Error("Loopback blocked (v6)"), { status: 422 });
+    for (const cidr of PRIVATE_V6)
+      if (ipInCidr6(ip, cidr)) throw Object.assign(new Error("Private network blocked (v6)"), { status: 422 });
+  }
+
+  return u.toString();
+}
+
 
 // Generic watchdog
 function withTimeout(promise, ms, label = "operation") {
@@ -726,34 +782,32 @@ app.post("/render", authMiddleware, async (req, res) => {
   req.setTimeout?.(HARD_TIMEOUT_MS + 5000);
 
   const t0 = now();
-
-  // MUST come first → then we can safely read values from them
   const q = req.query || {};
   const body = req.body || {};
 
-  // Relaxed mode: bypass per-step watchdogs (for n8n batches)
+  // Per-request relaxed mode (for n8n batches): bypass step watchdogs
   const relaxed =
     (process.env.RENDER_DISABLE_TIMEOUTS === "1") ||
     (String(body.relaxed ?? q.relaxed ?? "0") === "1");
 
-  // Per-request wrapper that respects relaxed mode
   const WT = (p, ms, label) => (relaxed ? p : withTimeout(p, ms, label));
 
-  // If relaxed, loosen socket timeouts too
   if (relaxed) {
-    const long = Math.max(120000, (HARD_TIMEOUT_MS || 45000) * 3); // ≥2 min
+    const long = Math.max(120000, (HARD_TIMEOUT_MS || 45000) * 3);
     res.setTimeout(long);
     req.setTimeout?.(long);
   }
 
-  // Now read the rest of params
+  // Params
   const urlRaw = (body.url || q.url || "").trim();
   const deviceKey = (body.device || q.device || "").trim();
   const debugOverlay = parseInt(body.debugOverlay ?? q.debugOverlay ?? 0, 10) === 1;
   const debugRects   = parseInt(body.debugRects   ?? q.debugRects   ?? 0, 10) === 1;
   const debugHeatmap = parseInt(body.debugHeatmap ?? q.debugHeatmap ?? 0, 10) === 1;
 
-  if (!urlRaw || !deviceKey) return res.status(400).json({ error: "Missing url or device" });
+  if (!urlRaw || !deviceKey) {
+    return res.status(400).json({ error: "Missing url or device" });
+  }
 
   let context = null, page = null;
   try {
@@ -762,31 +816,44 @@ app.post("/render", authMiddleware, async (req, res) => {
     if (!device) return res.status(400).json({ error: "Invalid device" });
 
     const browser = await WT(getBrowser(), 10000, "launch chromium");
-    // bypassCSP helps debug overlays/heatmap injection
-    context = await WT(browser.newContext({ ...device.contextOpts, bypassCSP: true }), 8000, "newContext");
+    context = await WT(
+      browser.newContext({ ...device.contextOpts, bypassCSP: true }),
+      8000,
+      "newContext"
+    );
     page = await WT(context.newPage(), 5000, "newPage");
     await prepPage(page);
 
+    // Navigate
     const navStart = now();
-    let asSeenPngBuf = null;
     await WT(page.goto(safeUrl, { waitUntil: "domcontentloaded" }), 15000, "page.goto");
     await page.waitForLoadState("networkidle", { timeout: 5000 }).catch(() => {});
+    // Small wait: late cookie bars often render after idle
+    await page.waitForTimeout(700).catch(() => {});
     const navEnd = now();
 
-    if (debugOverlay) asSeenPngBuf = await WT(PAGE_EVAL.asSeen(page), SNAP_TIMEOUT_MS, "asSeen screenshot");
+    // As-seen (optional)
+    let asSeenPngBuf = null;
+    if (debugOverlay) {
+      asSeenPngBuf = await WT(PAGE_EVAL.asSeen(page), SNAP_TIMEOUT_MS, "asSeen screenshot");
+    }
 
+    // Pre-hide overlay audit
     const preStart = now();
     const pre = await WT(PAGE_EVAL.preHideOverlays(page), 7000, "preHideOverlays");
     const preEnd = now();
 
+    // Hide overlays (tagged only)
     const hideStart = now();
     await WT(PAGE_EVAL.hideOverlays(page), 2000, "hideOverlays");
     const hideEnd = now();
 
+    // Clean audit (after hiding)
     const cleanStart = now();
     const { ux, debugRects: rectsForDebug } = await WT(PAGE_EVAL.cleanAudit(page), 9000, "cleanAudit");
     const cleanEnd = now();
 
+    // Clean screenshot
     const shotStart = now();
     const cleanPngBuf = await WT(
       page.screenshot({ type: "png", fullPage: false, timeout: SHOT_TIMEOUT_MS - 1000 }),
@@ -795,11 +862,13 @@ app.post("/render", authMiddleware, async (req, res) => {
     );
     const shotEnd = now();
 
+    // Heatmap (optional)
     let heatmapBuf = null;
     if (debugHeatmap) {
       heatmapBuf = await WT(PAGE_EVAL.heatmapPng(page, rectsForDebug), HEATMAP_TIMEOUT_MS, "heatmapPng");
     }
 
+    // Response
     const deviceMeta = {
       viewport: device.contextOpts.viewport,
       dpr: device.contextOpts.deviceScaleFactor,
@@ -811,15 +880,19 @@ app.post("/render", authMiddleware, async (req, res) => {
     const payload = {
       ts_ms: nowDate.getTime(),
       ts_iso: nowDate.toISOString(),
+      serviceVersion: SERVICE_VERSION,
+
       device: deviceKey,
       deviceMeta,
       pngBase64: cleanPngBuf.toString("base64"),
+
       ux: {
         ...ux,
         overlayCoveragePct: pre.overlayCoveragePct,
         overlayBlockers: pre.overlayBlockers,
         overlayElemsMarked: pre.overlayElemsMarked,
       },
+
       timings: {
         nav_ms: ms(navStart, navEnd),
         settle_ms: 0,
@@ -831,14 +904,23 @@ app.post("/render", authMiddleware, async (req, res) => {
       },
     };
 
-    if (debugOverlay && asSeenPngBuf) payload.pngWithOverlayBase64 = asSeenPngBuf.toString("base64");
-    if (debugRects) payload.debug = rectsForDebug;
-    if (debugHeatmap && heatmapBuf) payload.pngDebugBase64 = heatmapBuf.toString("base64");
+    if (debugOverlay && asSeenPngBuf) {
+      payload.pngWithOverlayBase64 = asSeenPngBuf.toString("base64");
+    }
+    if (debugHeatmap && heatmapBuf) {
+      payload.pngDebugBase64 = heatmapBuf.toString("base64");
+    }
+    if (debugRects) {
+      payload.debug = {
+        ...rectsForDebug,
+        overlayRects: pre.overlayRects, // <- from pre-hide pass
+      };
+    }
 
     return res.json(payload);
   } catch (err) {
     const status = err?.status || 500;
-    console.error("Render error:", err?.message || err);
+    console.error("Render error:", deviceKey, urlRaw, err?.message || err);
     return res.status(status).json({ error: String(err?.message || err) });
   } finally {
     try { await page?.close?.(); } catch {}
