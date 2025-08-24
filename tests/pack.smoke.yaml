@@ -8,31 +8,31 @@ tests:
   - id: poslik
     url: https://poslik.com
     expect:
-      foldCoveragePct: { min: 10, max: 95 }
+      foldCoveragePct: { min: 35, max: 93 }
       overlayCoveragePct: { max: 100 }
       smallTapTargets: { max: 12 }
-      hasViewportMeta: false
+      hasViewportMeta: true
   - id: sellerboard
     url: https://sellerboard.com
     expect:
-      foldCoveragePct: { min: 15, max: 95 }
+      foldCoveragePct: { min: 35, max: 93 }
       overlayCoveragePct: { max: 100 }
-      smallTapTargets: { max: 15 }
+      smallTapTargets: { max: 12 }
       hasViewportMeta: true
   - id: hiutdenim shopify
     url: https://hiutdenim.co.uk/products/the-hack-japanese-selvedge?Waist=28&Leg+Length=28
     expect:
-      foldCoveragePct: { min: 20, max: 95 }
+      foldCoveragePct: { min: 35, max: 93 }
       overlayCoveragePct: { max: 100 }
-      smallTapTargets: { max: 20 }
+      smallTapTargets: { max: 12 }
       hasViewportMeta: true
 
   - id: cocolab shopify
     url: https://cocolab.com/products/cocoshine-oishii
     expect:
-      foldCoveragePct: { min: 20, max: 95 }
+      foldCoveragePct: { min: 35, max: 93 }
       overlayCoveragePct: { max: 100 }
-      smallTapTargets: { max: 20 }
+      smallTapTargets: { max: 12 }
       hasViewportMeta: true
 
       
