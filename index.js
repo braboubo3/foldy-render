@@ -849,13 +849,6 @@ app.post("/render", authMiddleware, async (req, res) => {
       }
     }
 
-    // Pre-scan overlays with a deadline (soft-fail). If you're inside a class, keep `this.`.
-    // If you're in a plain module function, use: const pre = await preHideOverlays(page, { timeoutMs: HIDE_TIMEOUT_MS });
-    const { overlayRects, overlayCoveragePct } = pre;
-    
-    // If you keep a `ux` object, surface the pre-hide overlay % there (so it's in response.ux)
-    if (ux) ux.overlayCoveragePct = overlayCoveragePct;
-
 
     // Pre-hide overlay audit
     const preStart = now();
@@ -871,7 +864,7 @@ app.post("/render", authMiddleware, async (req, res) => {
 
     // Hide overlays (tagged only)
     const hideStart = now();
-    await WT(PAGE_EVAL.hideOverlays(page), 2000, "hideOverlays");
+    await WT(PAGE_EVAL.hideOverlays(page), HIDE_TIMEOUT_MS, "hideOverlays");
     const hideEnd = now();
 
     // Clean audit (after hiding)
@@ -881,6 +874,8 @@ app.post("/render", authMiddleware, async (req, res) => {
 
     // Clean screenshot
     const shotStart = now();
+    // settle webfonts to avoid empty text lines in screenshots
+    await page.evaluate(async () => { if (document.fonts?.ready) await document.fonts.ready; });
     const cleanPngBuf = await WT(
       page.screenshot({ type: "png", fullPage: false, timeout: SHOT_TIMEOUT_MS - 1000 }),
       SHOT_TIMEOUT_MS,
