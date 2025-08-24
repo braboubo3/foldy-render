@@ -16,6 +16,10 @@ const DNS_TIMEOUT_MS     = parseInt(process.env.RENDER_DNS_TIMEOUT_MS     || "40
 const SHOT_TIMEOUT_MS    = parseInt(process.env.RENDER_SHOT_TIMEOUT_MS    || "15000", 10);
 const HEATMAP_TIMEOUT_MS = parseInt(process.env.RENDER_HEATMAP_TIMEOUT_MS || "10000", 10);
 const SNAP_TIMEOUT_MS    = parseInt(process.env.RENDER_SNAP_TIMEOUT_MS    || "6000", 10);
+const NAV_TIMEOUT_MS        = Number(process.env.NAV_TIMEOUT_MS        ?? 22000); // README says ~15s, give heavier pages some headroom. :contentReference[oaicite:1]{index=1}
+const HIDE_TIMEOUT_MS       = Number(process.env.HIDE_TIMEOUT_MS       ?? 4000);
+const SCREENSHOT_TIMEOUT_MS = Number(process.env.SCREENSHOT_TIMEOUT_MS ?? 15000);
+
 
 if (!RENDER_TOKEN) {
   console.error("Missing RENDER_TOKEN");
@@ -235,8 +239,20 @@ const PAGE_EVAL = {
   async asSeen(page) { return page.screenshot({ type: "png", fullPage: false, timeout: SNAP_TIMEOUT_MS - 500 }); },
 
   // Pre-hide overlays
-  async preHideOverlays(page) {
-    return page.evaluate(() => {
+  // Run overlay pre-scan with a hard deadline; soft-fail on timeout.
+  // Usage: const pre = await this.preHideOverlays(page, { timeoutMs: HIDE_TIMEOUT_MS });
+  async preHideOverlays(
+    page,
+    { timeoutMs = (typeof HIDE_TIMEOUT_MS !== 'undefined' ? HIDE_TIMEOUT_MS : 4000) } = {}
+  ) {
+    // Small helper: give any promise a deadline
+    const withTimeout = (promise, ms, tag) => Promise.race([
+      promise,
+      new Promise((_, rej) => setTimeout(() => rej(new Error(`${tag}_TIMEOUT`)), ms))
+    ]);
+
+    try {
+      const res = await withTimeout(page.evaluate(() => {
       const vw = window.innerWidth, vh = window.innerHeight;
       const foldArea = vw * vh;
       function isVisible(el) {
@@ -291,7 +307,15 @@ const PAGE_EVAL = {
         overlayCoveragePct: Math.min(100, Math.round((overlayArea / foldArea) * 100)),
         overlayBlockers: candidates.length > 0 ? 1 : 0
       };
-    });
+      }), timeoutMs, 'PREHIDE');
+      return { ...res, _preHideTimedOut: false };
+    } catch (e) {
+      // Soft-fail on timeout; keep the run alive and signal the flag.
+      if ((e.message || '').includes('PREHIDE_TIMEOUT')) {
+        return { overlayRects: [], overlayElemsMarked: 0, overlayCoveragePct: 0, overlayBlockers: 0, _preHideTimedOut: true };
+      }
+      throw e; // real error → bubble up
+    }
   },
 
   // Hide ONLY tagged overlays
@@ -747,7 +771,8 @@ const PAGE_EVAL = {
       drawRects(debugRects.smallTapRects, "rgba(255, 215, 0, 0.95)"); // small tap targets
     }, debugRects);
 
-    const png = await page.screenshot({ type: "png", fullPage: false, timeout: HEATMAP_TIMEOUT_MS - 500 });
+    await page.evaluate(async () => { if (document.fonts?.ready) await document.fonts.ready; });
+    const png = await page.screenshot({ type: "png", fullPage: false, timeout: SCREENSHOT_TIMEOUT_MS });
     await page.evaluate(() => document.getElementById("_foldy_heatmap")?.remove());
     return png;
   },
@@ -806,7 +831,7 @@ app.post("/render", authMiddleware, async (req, res) => {
 
     // Navigate
     const navStart = now();
-    await WT(page.goto(safeUrl, { waitUntil: "domcontentloaded" }), 15000, "page.goto");
+    await WT(page.goto(safeUrl, { waitUntil: "domcontentloaded" }), NAV_TIMEOUT_MS, "page.goto");
     await page.waitForLoadState("networkidle", { timeout: 5000 }).catch(() => {});
     // Small wait: late cookie bars often render after idle
     await page.waitForTimeout(700).catch(() => {});
@@ -815,8 +840,23 @@ app.post("/render", authMiddleware, async (req, res) => {
     // As-seen (optional)
     let asSeenPngBuf = null;
     if (debugOverlay) {
-      asSeenPngBuf = await WT(PAGE_EVAL.asSeen(page), SNAP_TIMEOUT_MS, "asSeen screenshot");
+      try {
+        await page.evaluate(async () => { if (document.fonts?.ready) await document.fonts.ready; });
+        asSeenPngBuf = await page.screenshot({ type: "png", fullPage: false, timeout: SCREENSHOT_TIMEOUT_MS });
+      } catch (e) {
+        console.warn('[debugOverlay] as-seen failed:', e?.message || e);
+        // continue; not fatal
+      }
     }
+
+    // Pre-scan overlays with a deadline (soft-fail). If you're inside a class, keep `this.`.
+    // If you're in a plain module function, use: const pre = await preHideOverlays(page, { timeoutMs: HIDE_TIMEOUT_MS });
+    const pre = await this.preHideOverlays(page, { timeoutMs: HIDE_TIMEOUT_MS });
+    const { overlayRects, overlayCoveragePct } = pre;
+    
+    // If you keep a `ux` object, surface the pre-hide overlay % there (so it's in response.ux)
+    if (ux) ux.overlayCoveragePct = overlayCoveragePct;
+
 
     // Pre-hide overlay audit
     const preStart = now();
@@ -881,6 +921,10 @@ app.post("/render", authMiddleware, async (req, res) => {
         clean_ms: ms(cleanStart, cleanEnd),
         screenshot_ms: ms(shotStart, shotEnd),
         total_ms: ms(t0, now()),
+      },
+       debugFlags: {
+        preHideTimedOut: pre?._preHideTimedOut === true,
+        asSeenFailed: Boolean(debugOverlay && !asSeenPngBuf),
       },
     };
 
