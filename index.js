@@ -128,26 +128,6 @@ async function resolve4WithTimeout(hostname, ms) {
   return withTimeout(dns.resolve4(hostname, { ttl: false }), ms, `DNS resolve(${hostname})`);
 }
 
-async function assertUrlAllowed(raw) {
-  let u;
-  try { u = new URL(raw); } catch { throw Object.assign(new Error("Invalid URL"), { status: 400 }); }
-  if (!["http:", "https:"].includes(u.protocol)) {
-    throw Object.assign(new Error("Only http/https allowed"), { status: 422 });
-  }
-  const hostLower = (u.hostname || "").toLowerCase();
-  if (hostLower === "localhost" || hostLower === "127.0.0.1" || hostLower === "::1") {
-    throw Object.assign(new Error("Localhost blocked"), { status: 422 });
-  }
-  let addrs = [];
-  try { addrs = await resolve4WithTimeout(u.hostname, DNS_TIMEOUT_MS); } catch { addrs = []; }
-  for (const ip of addrs) {
-    for (const cidr of PRIVATE_CIDRS) {
-      if (ipInCidr(ip, cidr)) throw Object.assign(new Error("Private network blocked"), { status: 422 });
-    }
-  }
-  return u.toString();
-}
-
 /** ---------- Devices ---------- **/
 const DEVICES = {
   iphone_15_pro: {
