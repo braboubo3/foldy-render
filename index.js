@@ -851,7 +851,6 @@ app.post("/render", authMiddleware, async (req, res) => {
 
     // Pre-scan overlays with a deadline (soft-fail). If you're inside a class, keep `this.`.
     // If you're in a plain module function, use: const pre = await preHideOverlays(page, { timeoutMs: HIDE_TIMEOUT_MS });
-    const pre = await this.preHideOverlays(page, { timeoutMs: HIDE_TIMEOUT_MS });
     const { overlayRects, overlayCoveragePct } = pre;
     
     // If you keep a `ux` object, surface the pre-hide overlay % there (so it's in response.ux)
@@ -860,7 +859,14 @@ app.post("/render", authMiddleware, async (req, res) => {
 
     // Pre-hide overlay audit
     const preStart = now();
-    const pre = await WT(PAGE_EVAL.preHideOverlays(page), 7000, "preHideOverlays");
+     // Pre-scan overlays using WT; soft-fail on timeout/error
+     let pre = { overlayRects: [], overlayElemsMarked: 0, overlayCoveragePct: 0, overlayBlockers: 0, _preHideTimedOut: false };
+     try {
+       pre = await WT(PAGE_EVAL.preHideOverlays(page), HIDE_TIMEOUT_MS, "preHideOverlays");
+     } catch (e) {
+       pre._preHideTimedOut = true;
+       console.warn("[preHideOverlays] soft-fail:", e?.message || e);
+     }
     const preEnd = now();
 
     // Hide overlays (tagged only)
