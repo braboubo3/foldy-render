@@ -236,7 +236,7 @@ async function prepPage(page) {
 
 /** ---------- In-page auditing ---------- **/
 const PAGE_EVAL = {
-  async asSeen(page) { return page.screenshot({ type: "png", fullPage: false, timeout: SNAP_TIMEOUT_MS - 500 }); },
+  async asSeen(page) { return page.screenshot({ type: "png", fullPage: false, timeout: relaxed ? 0 : (SNAP_TIMEOUT_MS - 500) }); },
 
   // Pre-hide overlays
   // Run overlay pre-scan with a hard deadline; soft-fail on timeout.
@@ -772,7 +772,7 @@ const PAGE_EVAL = {
     }, debugRects);
 
     await page.evaluate(async () => { if (document.fonts?.ready) await document.fonts.ready; });
-    const png = await page.screenshot({ type: "png", fullPage: false, timeout: SCREENSHOT_TIMEOUT_MS });
+    const png = await page.screenshot({ type: "png", fullPage: false, timeout: relaxed ? 0 : SCREENSHOT_TIMEOUT_MS });
     await page.evaluate(() => document.getElementById("_foldy_heatmap")?.remove());
     return png;
   },
@@ -827,11 +827,16 @@ app.post("/render", authMiddleware, async (req, res) => {
       "newContext"
     );
     page = await WT(context.newPage(), 5000, "newPage");
-    await prepPage(page);
+     await prepPage(page);
+     if (relaxed) {
+       // Disable Playwright’s built-in timeouts for this request
+       page.setDefaultTimeout(0);
+       page.setDefaultNavigationTimeout(0);
+     }
 
     // Navigate
     const navStart = now();
-    await WT(page.goto(safeUrl, { waitUntil: "domcontentloaded" }), NAV_TIMEOUT_MS, "page.goto");
+     await WT(page.goto(safeUrl, { waitUntil: "domcontentloaded", timeout: relaxed ? 0 : NAV_TIMEOUT_MS }), NAV_TIMEOUT_MS, "page.goto");
     await page.waitForLoadState("networkidle", { timeout: 5000 }).catch(() => {});
     // Small wait: late cookie bars often render after idle
     await page.waitForTimeout(700).catch(() => {});
@@ -842,7 +847,7 @@ app.post("/render", authMiddleware, async (req, res) => {
     if (debugOverlay) {
       try {
         await page.evaluate(async () => { if (document.fonts?.ready) await document.fonts.ready; });
-        asSeenPngBuf = await page.screenshot({ type: "png", fullPage: false, timeout: SCREENSHOT_TIMEOUT_MS });
+        asSeenPngBuf = await page.screenshot({ type: "png", fullPage: false, timeout: relaxed ? 0 : SCREENSHOT_TIMEOUT_MS });
       } catch (e) {
         console.warn('[debugOverlay] as-seen failed:', e?.message || e);
         // continue; not fatal
@@ -877,7 +882,7 @@ app.post("/render", authMiddleware, async (req, res) => {
     // settle webfonts to avoid empty text lines in screenshots
     await page.evaluate(async () => { if (document.fonts?.ready) await document.fonts.ready; });
     const cleanPngBuf = await WT(
-      page.screenshot({ type: "png", fullPage: false, timeout: SHOT_TIMEOUT_MS - 1000 }),
+      page.screenshot({ type: "png", fullPage: false, timeout: relaxed ? 0 : (SHOT_TIMEOUT_MS - 1000) }),
       SHOT_TIMEOUT_MS,
       "clean screenshot"
     );
