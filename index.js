@@ -16,10 +16,9 @@ const DNS_TIMEOUT_MS     = parseInt(process.env.RENDER_DNS_TIMEOUT_MS     || "40
 const SHOT_TIMEOUT_MS    = parseInt(process.env.RENDER_SHOT_TIMEOUT_MS    || "15000", 10);
 const HEATMAP_TIMEOUT_MS = parseInt(process.env.RENDER_HEATMAP_TIMEOUT_MS || "10000", 10);
 const SNAP_TIMEOUT_MS    = parseInt(process.env.RENDER_SNAP_TIMEOUT_MS    || "6000", 10);
-const NAV_TIMEOUT_MS        = Number(process.env.NAV_TIMEOUT_MS        ?? 22000); // README says ~15s, give heavier pages some headroom. :contentReference[oaicite:1]{index=1}
+const NAV_TIMEOUT_MS        = Number(process.env.NAV_TIMEOUT_MS        ?? 22000); // README says ~15s, give heavier pages some headroom.
 const HIDE_TIMEOUT_MS       = Number(process.env.HIDE_TIMEOUT_MS       ?? 4000);
 const SCREENSHOT_TIMEOUT_MS = Number(process.env.SCREENSHOT_TIMEOUT_MS ?? 15000);
-
 
 if (!RENDER_TOKEN) {
   console.error("Missing RENDER_TOKEN");
@@ -222,6 +221,8 @@ async function prepPage(page) {
     if (shouldAbort) return route.abort();
     return route.continue();
   });
+
+  // Disable animations and scroll-behavior
   await page.addInitScript(() => {
     try {
       const s = document.createElement("style");
@@ -230,22 +231,118 @@ async function prepPage(page) {
       document.documentElement.appendChild(s);
     } catch {}
   });
+
+  // NEW: CTA TTV watcher (starts at earliest script run)
+  await page.addInitScript(() => {
+    (function () {
+      try {
+        const t0 = performance.now();
+        const CTA_PHRASES = [
+          "get started","start now","request a demo","book a demo","request demo",
+          "buy","add to cart","sign up","log in","subscribe","try","contact","learn more",
+          "demander une demo","demander une démo","essayer","nous contacter","en savoir plus",
+          "commencer","acheter","ajouter au panier","reserver","réserver","s'inscrire","se connecter",
+          "demo anfordern","jetzt starten","kaufen","in den warenkorb","buchen","registrieren","anmelden","testen","kontakt","mehr erfahren",
+          "solicitar una demo","empezar","comprar","añadir al carrito","reservar","regístrate","iniciar sesion","iniciar sesión","probar","contacto","mas informacion","más información",
+          "solicitar uma demo","comecar","começar","comprar","adicionar ao carrinho","reservar","inscrever-se","entrar","experimentar","contato","saiba mais",
+          "richiedi una demo","inizia","compra","aggiungi al carrello","prenota","iscriviti","accedi","prova","contattaci","scopri di piu","scopri di più"
+        ];
+        const norm = (t) => (t||"").toLowerCase().normalize("NFD").replace(/[\u0300-\u036f]/g,"");
+        const isVisible = (el) => {
+          const cs = getComputedStyle(el);
+          if (cs.visibility === "hidden" || cs.display === "none" || parseFloat(cs.opacity||"1") < 0.05) return false;
+          const r = el.getBoundingClientRect();
+          return r.width > 0 && r.height > 0;
+        };
+        const looksLikeButton = (el) => {
+          const role = (el.getAttribute("role") || "").toLowerCase();
+          const type = (el.getAttribute("type") || "").toLowerCase();
+          const cls  = (el.className || "").toString().toLowerCase();
+          const id   = (el.id || "").toLowerCase();
+          const classHit = /\b(btn|button|cta|primary|pill|calltoaction|call-to-action)\b/.test(cls)
+                        || /\b(btn|button|cta|primary|pill)\b/.test(id)
+                        || /\b(btn-|button-|cta-|primary-)/.test(cls);
+          const cs = getComputedStyle(el);
+          const hasBg = cs.backgroundColor && cs.backgroundColor !== "rgba(0, 0, 0, 0)" && cs.backgroundColor !== "transparent";
+          const radius = ["borderTopLeftRadius","borderTopRightRadius","borderBottomLeftRadius","borderBottomRightRadius"]
+            .map(k => parseFloat(cs[k] || "0")).reduce((a,b)=>a+b,0);
+          const rounded = radius >= 12;
+          return classHit || role === "button" || type === "button" || type === "submit" || (hasBg && rounded);
+        };
+        const isCTA = (el) => {
+          if (!el.matches || !el.matches("a,button,[role='button']")) return false;
+          if (!isVisible(el)) return false;
+          const txt = norm(el.innerText || "");
+          const phrase = txt.length > 2 && CTA_PHRASES.some(p => txt.includes(p));
+          return phrase || looksLikeButton(el);
+        };
+        let done = false;
+        const mark = () => {
+          if (done) return;
+          done = true;
+          window._foldyCtaTtvMs = Math.max(0, Math.round(performance.now() - t0));
+        };
+        // IO to detect entry into viewport
+        const io = new IntersectionObserver((entries) => {
+          for (const e of entries) {
+            if (e.isIntersecting) { mark(); break; }
+          }
+        }, { root: null, threshold: [0, 0.01] });
+
+        // Seed & watch DOM
+        const seed = () => {
+          document.querySelectorAll("a,button,[role='button']").forEach((el) => { if (isCTA(el)) io.observe(el); });
+        };
+        const mo = new MutationObserver((muts) => {
+          for (const m of muts) for (const n of m.addedNodes) {
+            if (n.nodeType !== 1) continue;
+            const el = n;
+            if (isCTA(el)) io.observe(el);
+            el.querySelectorAll?.("a,button,[role='button']").forEach((c) => { if (isCTA(c)) io.observe(c); });
+          }
+        });
+
+        document.addEventListener("DOMContentLoaded", seed, { once: true });
+        try { seed(); } catch {}
+        try { mo.observe(document.documentElement, { childList: true, subtree: true }); } catch {}
+
+        // Fallback: if already visible soon after load
+        setTimeout(() => {
+          try {
+            if (!window._foldyCtaTtvMs) {
+              const any = Array.from(document.querySelectorAll("a,button,[role='button']")).some((el) => {
+                if (!isCTA(el)) return false;
+                const r = el.getBoundingClientRect();
+                return r.top < innerHeight && r.bottom > 0 && r.left < innerWidth && r.right > 0;
+              });
+              if (any) mark();
+            }
+          } catch {}
+        }, 3000);
+
+        // Hard cap to avoid watchers lingering forever
+        setTimeout(() => {
+          if (!window._foldyCtaTtvMs) window._foldyCtaTtvMs = Math.max(0, Math.round(performance.now() - t0));
+          io.disconnect?.(); mo.disconnect?.();
+        }, 30000);
+      } catch {}
+    })();
+  });
+  // END NEW: CTA TTV watcher
+
   page.setDefaultTimeout(15000);
   page.setDefaultNavigationTimeout(15000);
 }
 
 /** ---------- In-page auditing ---------- **/
 const PAGE_EVAL = {
-  async asSeen(page) { return page.screenshot({ type: "png", fullPage: false, timeout: relaxed ? 0 : (SNAP_TIMEOUT_MS - 500) }); },
+  async asSeen(page) { return page.screenshot({ type: "png", fullPage: false, timeout: SNAP_TIMEOUT_MS - 500 }); },
 
   // Pre-hide overlays
-  // Run overlay pre-scan with a hard deadline; soft-fail on timeout.
-  // Usage: const pre = await this.preHideOverlays(page, { timeoutMs: HIDE_TIMEOUT_MS });
   async preHideOverlays(
     page,
     { timeoutMs = (typeof HIDE_TIMEOUT_MS !== 'undefined' ? HIDE_TIMEOUT_MS : 4000) } = {}
   ) {
-    // Small helper: give any promise a deadline
     const withTimeout = (promise, ms, tag) => Promise.race([
       promise,
       new Promise((_, rej) => setTimeout(() => rej(new Error(`${tag}_TIMEOUT`)), ms))
@@ -276,18 +373,15 @@ const PAGE_EVAL = {
           txt.includes("cookie") || txt.includes("consent") ||
           txt.includes("accept all") || txt.includes("agree");
 
-        // bottom bar must be wide and contain at least two actionable items
         const btnCount = el.querySelectorAll("button,a,[role='button']").length;
         const wideBar = (inFoldWidth / vw) >= 0.6;
         const likelyBar = (r.height >= 48 && r.top >= vh - 220 && wideBar && btnCount >= 2);
 
         if (looksLikeCookie) return true;
         if (likelyBar) return true;
-        // otherwise require larger area to avoid tagging tiny pills
         return inFoldArea / foldArea >= 0.20;
       });
 
-      // Tag actual overlay nodes so we hide only them
       candidates.forEach((el) => { try { el.setAttribute("data-foldy-overlay-candidate", "1"); } catch {} });
 
       const overlayRects = candidates.map((el) => {
@@ -310,11 +404,10 @@ const PAGE_EVAL = {
       }), timeoutMs, 'PREHIDE');
       return { ...res, _preHideTimedOut: false };
     } catch (e) {
-      // Soft-fail on timeout; keep the run alive and signal the flag.
       if ((e.message || '').includes('PREHIDE_TIMEOUT')) {
         return { overlayRects: [], overlayElemsMarked: 0, overlayCoveragePct: 0, overlayBlockers: 0, _preHideTimedOut: true };
       }
-      throw e; // real error → bubble up
+      throw e;
     }
   },
 
@@ -323,7 +416,7 @@ const PAGE_EVAL = {
     await page.addStyleTag({ content: `[data-foldy-overlay-candidate="1"]{display:none!important}` });
   },
 
-  // Compute coverage + metrics
+  // Compute coverage + metrics (+ NEW heuristics)
   async cleanAudit(page) {
     return page.evaluate(() => {
       const vw = window.innerWidth, vh = window.innerHeight;
@@ -337,17 +430,13 @@ const PAGE_EVAL = {
       function clamp(n, lo, hi) { return Math.max(lo, Math.min(hi, n)); }
       function isVisible(el) {
         const cs = getComputedStyle(el);
-        // hidden or collapsed
         if (cs.visibility === "hidden" || cs.display === "none") return false;
-        // effectively invisible (helps remove ghost text in translucent layers)
         if (parseFloat(cs.opacity || "1") < 0.05) return false;
-      
         const r = el.getBoundingClientRect();
         if (r.width <= 0 || r.height <= 0) return false;
         if (r.bottom <= 0 || r.right <= 0 || r.top >= vh || r.left >= vw) return false;
         return true;
       }
-
 
       // --- helpers for CTA detection ---
       function norm(t) {
@@ -387,113 +476,82 @@ const PAGE_EVAL = {
         return classHit || roleHit || typeHit || (hasBg && rounded);
       }
 
-      // --- Rect collectors ---
+      // --- Rect collectors (text/media/cta/hero) ---
       function rectsForTextNodes() {
         const rects = [];
         const vw = window.innerWidth, vh = window.innerHeight;
-      
-        // Unicode whitespace (incl. NBSP, hair, narrow, ZW, BOM…)
         const WS = /[\s\u00A0\u1680\u180E\u2000-\u200B\u202F\u205F\u3000\uFEFF]/;
-      
-        // rgba() alpha extractor
         const alphaOf = (cssColor) => {
           const m = /\brgba?\(\s*([\d.]+)\s*,\s*([\d.]+)\s*,\s*([\d.]+)(?:\s*,\s*([\d.]+))?\s*\)/i.exec(cssColor || "");
           return m ? (m[4] === undefined ? 1 : parseFloat(m[4])) : 1;
         };
-      
-        // probe if a rect contains at least one non-whitespace glyph
         function rectHasGlyph(rect) {
           const { left, top, width, height } = rect;
           if (width <= 0 || height <= 0) return false;
-      
-          const samples = Math.min(10, Math.max(3, Math.ceil(width / 8))); // 3..10 points
+          const samples = Math.min(10, Math.max(3, Math.ceil(width / 8)));
           const y = Math.min(vh - 1, Math.max(0, top + height / 2));
-      
           for (let i = 0; i < samples; i++) {
             const x = Math.min(vw - 1, Math.max(0, left + ((i + 0.5) / samples) * width));
-      
-            // Try both APIs for wider browser support
             const cp = (document.caretPositionFromPoint && document.caretPositionFromPoint(x, y)) || null;
             if (cp && cp.offsetNode && cp.offsetNode.nodeType === Node.TEXT_NODE) {
-              const s = cp.offsetNode.nodeValue || "";
-              const k = Math.min(Math.max(cp.offset, 0), Math.max(0, s.length - 1));
+              const s = cp.offsetNode.nodeValue || ""; const k = Math.min(Math.max(cp.offset, 0), Math.max(0, s.length - 1));
               if (s[k] && !WS.test(s[k])) return true;
             }
-      
             const cr = (document.caretRangeFromPoint && document.caretRangeFromPoint(x, y)) || null;
             if (cr && cr.startContainer && cr.startContainer.nodeType === Node.TEXT_NODE) {
-              const s = cr.startContainer.nodeValue || "";
-              const k = Math.min(Math.max(cr.startOffset, 0), Math.max(0, s.length - 1));
+              const s = cr.startContainer.nodeValue || ""; const k = Math.min(Math.max(cr.startOffset, 0), Math.max(0, s.length - 1));
               if (s[k] && !WS.test(s[k])) return true;
             }
           }
-          return false; // only spaces seen
+          return false;
         }
-      
         const walker = document.createTreeWalker(
           document.body,
           NodeFilter.SHOW_TEXT,
           {
             acceptNode: (n) => {
               const s = n.nodeValue || "";
-              // Trim ends; if entire node becomes whitespace → reject early
               let i = 0, j = s.length - 1;
               while (i <= j && WS.test(s[i])) i++;
               while (j >= i && WS.test(s[j])) j--;
               if (j < i) return NodeFilter.FILTER_REJECT;
-      
               const el = n.parentElement;
               if (!el) return NodeFilter.FILTER_REJECT;
-      
               const cs = getComputedStyle(el);
               if (cs.visibility === "hidden" || cs.display === "none") return NodeFilter.FILTER_REJECT;
               if (parseFloat(cs.opacity || "1") < 0.05) return NodeFilter.FILTER_REJECT;
-      
               const fs = parseFloat(cs.fontSize || "0");
               if (fs < 8) return NodeFilter.FILTER_REJECT;
-      
-              // transparent text (color alpha 0 or -webkit-text-fill-color transparent)
               const aColor = alphaOf(cs.color);
               const fill = cs.webkitTextFillColor || "";
               const fillTransparent = fill === "transparent" || /rgba\(\s*0\s*,\s*0\s*,\s*0\s*,\s*0\s*\)/i.test(fill);
               if (aColor < 0.05 || fillTransparent) return NodeFilter.FILTER_REJECT;
-      
               return NodeFilter.FILTER_ACCEPT;
             }
           }
         );
-      
         let node;
         while ((node = walker.nextNode())) {
           const el = node.parentElement;
           const cs = getComputedStyle(el);
           const fs = parseFloat(cs.fontSize || "0");
-      
-          // Select the WHOLE node first; we’ll validate each rect contains a glyph
           const range = document.createRange();
           try {
             range.selectNodeContents(node);
-            const list = range.getClientRects(); // per-line fragments
-      
+            const list = range.getClientRects();
             for (const r of list) {
-              if (!rectHasGlyph(r)) continue; // <- drop whitespace-only fragments
-      
+              if (!rectHasGlyph(r)) continue;
               let x = Math.max(0, Math.min(r.left, vw));
               let y = Math.max(0, Math.min(r.top, vh));
               let w = Math.max(0, Math.min(r.right, vw) - x);
               let h = Math.max(0, Math.min(r.bottom, vh) - y);
               if (w <= 1 || h <= 6) continue;
-      
-              // tighten vertically to ~font-size
               const targetH = Math.min(h, Math.max(8, fs * 1.3));
               const dy = (h - targetH) / 2;
               y = Math.max(0, Math.min(y + dy, vh));
               h = Math.max(0, Math.min(targetH, vh - y));
-      
-              // small erosion to avoid gutters
               x = Math.min(x + 1, vw); y = Math.min(y + 1, vh);
               w = Math.max(0, w - 2);  h = Math.max(0, h - 2);
-      
               if (w > 0 && h > 0) rects.push([x, y, w, h]);
             }
           } catch {}
@@ -501,8 +559,6 @@ const PAGE_EVAL = {
         }
         return rects;
       }
-
-
 
       function rectsForMedia() {
         const rects = [];
@@ -574,7 +630,7 @@ const PAGE_EVAL = {
           const isRaster = /\.(jpe?g|png|webp|avif)(\?|$)/i.test(url0) ||
                            /^data:image\/(jpeg|jpg|png|webp|avif)/i.test(url0);
           const isSvg = /\.svg(\?|$)/i.test(url0) || /^data:image\/svg\+xml/i.test(url0);
-          if (!isRaster || isSvg) return; // raster only (ignore SVG backgrounds)
+          if (!isRaster || isSvg) return;
 
           const nonRepeating = /no-repeat/i.test(cs.backgroundRepeat || "");
           const large = /cover|contain/i.test(cs.backgroundSize || "");
@@ -632,7 +688,7 @@ const PAGE_EVAL = {
           const r = el.getBoundingClientRect();
           if (r.top >= 0 && r.bottom <= window.innerHeight) { firstInFold = true; break; }
         }
-        return { firstCtaInFold: firstInFold };
+        return { firstCtaInFold: firstInFold, ctaCandidatesCount: candidates.length };
       }
 
       function foldFontStats() {
@@ -651,16 +707,15 @@ const PAGE_EVAL = {
         const targets = Array.from(document.querySelectorAll(
           "a,button,[role='button'],input[type='button'],input[type='submit']"
         )).filter(isVisible);
-      
+
         const rects = [];
         let count = 0;
-      
+
         targets.forEach((el) => {
           const r = el.getBoundingClientRect();
-          // ignore typical chat-bubble area
           const isChatBubble = (r.width <= 64 && r.height <= 64 && r.right >= vw - 80 && r.bottom >= vh - 140);
           if (isChatBubble) return;
-      
+
           if (r.top < vh && r.bottom > 0) {
             const minSide = Math.min(r.width, r.height);
             if (minSide < 44) {
@@ -673,14 +728,123 @@ const PAGE_EVAL = {
             }
           }
         });
-      
+
         return { count, rects };
       }
 
-
       function hasViewportMeta() { return !!document.querySelector('meta[name="viewport"]'); }
+
+      // NEW — Safe-Area checks
+      const viewportMetaEl = document.querySelector('meta[name="viewport"]');
+      const viewportContent = (viewportMetaEl?.getAttribute("content") || "").toLowerCase();
+      const viewportFitCover = /\bviewport-fit\s*=\s*cover\b/.test(viewportContent);
+      const usesSafeAreaCSS = (() => {
+        const sheets = Array.from(document.querySelectorAll("style"));
+        const sheetHit = sheets.some((s) => (s.textContent || "").includes("safe-area-inset"));
+        const inlineHit = Array.from(document.querySelectorAll("[style]")).some((el) =>
+          (el.getAttribute("style") || "").includes("safe-area-inset")
+        );
+        return sheetHit || inlineHit;
+      })();
+
+      function bandIntersects(rects, y0, y1) {
+        return rects.some(([x, y, w, h]) => {
+          const yy0 = Math.max(y, y0), yy1 = Math.min(y + h, y1);
+          const xx0 = Math.max(x, 0),    xx1 = Math.min(x + w, vw);
+          return (yy1 - yy0) > 2 && (xx1 - xx0) > 2;
+        });
+      }
+
+      // Fixed header detector (top-pinned, wide, fixed|sticky)
+      function fixedHeaderPct() {
+        let maxH = 0;
+        const els = Array.from(document.querySelectorAll("body *")).filter(isVisible);
+        for (const el of els) {
+          const cs = getComputedStyle(el);
+          const pos = cs.position;
+          if (!(pos === "fixed" || pos === "sticky")) continue;
+          const r = el.getBoundingClientRect();
+          const nearTop = r.top <= 2;
+          const wide = r.width >= 0.8 * vw;
+          if (nearTop && wide && r.height > 8) {
+            maxH = Math.max(maxH, r.height);
+          }
+        }
+        return Math.min(100, Math.round((maxH / vh) * 100));
+      }
+
+      // CTA contrast (WCAG AA) — compute min ratio among in-fold CTAs
+      function parseColorToRGBA(s) {
+        if (!s) return [255,255,255,1];
+        s = s.trim().toLowerCase();
+        // rgb/rgba()
+        let m = s.match(/^rgba?\(([^)]+)\)$/);
+        if (m) {
+          const parts = m[1].split(",").map(x => x.trim());
+          const r = parseFloat(parts[0]), g = parseFloat(parts[1]), b = parseFloat(parts[2]);
+          const a = parts[3] !== undefined ? parseFloat(parts[3]) : 1;
+          return [r,g,b, isNaN(a) ? 1 : a];
+        }
+        // #rgb/#rrggbb
+        m = s.match(/^#([0-9a-f]{3,8})$/i);
+        if (m) {
+          const hex = m[1];
+          if (hex.length === 3) {
+            const r = parseInt(hex[0]+hex[0],16), g = parseInt(hex[1]+hex[1],16), b = parseInt(hex[2]+hex[2],16);
+            return [r,g,b,1];
+          }
+          if (hex.length === 6) {
+            const r = parseInt(hex.slice(0,2),16), g = parseInt(hex.slice(2,4),16), b = parseInt(hex.slice(4,6),16);
+            return [r,g,b,1];
+          }
+          if (hex.length === 8) {
+            const r = parseInt(hex.slice(0,2),16), g = parseInt(hex.slice(2,4),16), b = parseInt(hex.slice(4,6),16), a = parseInt(hex.slice(6,8),16)/255;
+            return [r,g,b,a];
+          }
+        }
+        // default
+        return [255,255,255,1];
+      }
+      function relLum([r,g,b]) {
+        const f = (c) => {
+          c = c/255;
+          return (c <= 0.03928) ? (c/12.92) : Math.pow((c+0.055)/1.055, 2.4);
+        };
+        return 0.2126*f(r) + 0.7152*f(g) + 0.0722*f(b);
+      }
+      function effectiveBgRGBA(el) {
+        let node = el;
+        while (node && node !== document.documentElement) {
+          const cs = getComputedStyle(node);
+          const bg = cs.backgroundColor;
+          const [r,g,b,a] = parseColorToRGBA(bg);
+          if (a > 0.01 && !(r===0 && g===0 && b===0 && a===0)) return [r,g,b,a];
+          node = node.parentElement;
+        }
+        return [255,255,255,1]; // fallback white
+      }
+      function minCtaContrastInFold(els) {
+        let minRatio = Infinity;
+        let any = false;
+        for (const el of els) {
+          if (!isVisible(el)) continue;
+          const r = el.getBoundingClientRect();
+          if (!(r.top >= 0 && r.bottom <= vh)) continue; // must be fully in fold
+          const cs = getComputedStyle(el);
+          const fg = parseColorToRGBA(cs.color);
+          const bg = effectiveBgRGBA(el);
+          const L1 = relLum([fg[0],fg[1],fg[2]]);
+          const L2 = relLum([bg[0],bg[1],bg[2]]);
+          const ratio = (Math.max(L1,L2) + 0.05) / (Math.min(L1,L2) + 0.05);
+          if (Number.isFinite(ratio)) {
+            minRatio = Math.min(minRatio, ratio);
+            any = true;
+          }
+        }
+        return any ? minRatio : null;
+      }
+
       const small = smallTapTargets();
-      
       const textRects = rectsForTextNodes();
       const mediaRects = rectsForMedia();
       const ctaRects = rectsForCTAs();
@@ -691,13 +855,23 @@ const PAGE_EVAL = {
 
       const foldCoveragePct = Math.round((coveredCells.length / (GRID_ROWS * GRID_COLS)) * 100);
       const paintedCoveragePct = 100; // reserved
-      const { firstCtaInFold } = ctaDetection();
+
+      const { firstCtaInFold, ctaCandidatesCount } = ctaDetection();
       const { minFontPx, maxFontPx } = foldFontStats();
 
-      const usesSafeAreaCSS = (() => {
-        const sheets = Array.from(document.querySelectorAll("style"));
-        return sheets.some((s) => (s.textContent || "").includes("safe-area-inset"));
-      })();
+      // NEW — Safe-area risk bands (heuristic heights)
+      const TOP_BAND = 44;   // approx iOS sensor+bar zone in CSS px
+      const BOT_BAND = 34;   // approx iOS home indicator zone
+      const safeAreaRiskTop    = viewportFitCover && !usesSafeAreaCSS && bandIntersects(allRects, 0, TOP_BAND);
+      const safeAreaRiskBottom = viewportFitCover && !usesSafeAreaCSS && bandIntersects(allRects, vh - BOT_BAND, vh);
+
+      // NEW — Fixed header pct
+      const fixedHeaderPctVal = fixedHeaderPct();
+
+      // NEW — CTA contrast
+      const ctaNodes = Array.from(document.querySelectorAll("a,button,[role='button']")).filter((el) => (hasCtaText(el) || looksLikeButton(el)));
+      const ctaContrastMin = minCtaContrastInFold(ctaNodes);
+      const ctaContrastFail = (ctaContrastMin !== null) ? (ctaContrastMin < 4.5) : false;
 
       return {
         ux: {
@@ -709,7 +883,16 @@ const PAGE_EVAL = {
           minFontPx,
           smallTapTargets: small.count,
           hasViewportMeta: hasViewportMeta(),
+
+          // NEW fields
+          viewportFitCover,
           usesSafeAreaCSS,
+          safeAreaRiskTop,
+          safeAreaRiskBottom,
+          fixedHeaderPct: fixedHeaderPctVal,
+          ctaContrastMin: (ctaContrastMin !== null ? Number(ctaContrastMin.toFixed(2)) : null),
+          ctaContrastFail,
+          ctaCandidatesCount
         },
         debugRects: {
           rows: GRID_ROWS,
@@ -742,7 +925,6 @@ const PAGE_EVAL = {
       const cols = debugRects.cols, rows = debugRects.rows;
       const cellW = w / cols, cellH = h / rows;
 
-      // grid fill (what we count)
       ctx.fillStyle = "rgba(0,255,0,0.12)";
       for (let i = 0; i < debugRects.coveredCells.length; i++) {
         const idx = debugRects.coveredCells[i];
@@ -751,16 +933,16 @@ const PAGE_EVAL = {
         ctx.fillRect(gx * cellW, gy * cellH, cellW, cellH);
       }
 
-      // strokes (limited to prevent slow draws)
       const MAX_STROKES = 2000;
       let drawn = 0;
       function drawRects(rects, stroke) {
         if (!rects) return;
-        ctx.strokeStyle = stroke;
+        const ctx2 = ctx;
+        ctx2.strokeStyle = stroke;
         const n = Math.min(rects.length, Math.max(0, MAX_STROKES - drawn));
         for (let i = 0; i < n; i++) {
           const [x, y, w, h] = rects[i];
-          ctx.strokeRect(x, y, w, h);
+          ctx2.strokeRect(x, y, w, h);
         }
         drawn += n;
       }
@@ -768,11 +950,11 @@ const PAGE_EVAL = {
       drawRects(debugRects.mediaRects,  "rgba(0,0,255,0.7)");
       drawRects(debugRects.ctaRects,    "rgba(128,0,128,0.85)");
       drawRects(debugRects.heroBgRects, "rgba(255,165,0,0.8)");
-      drawRects(debugRects.smallTapRects, "rgba(255, 215, 0, 0.95)"); // small tap targets
+      drawRects(debugRects.smallTapRects, "rgba(255, 215, 0, 0.95)");
     }, debugRects);
 
     await page.evaluate(async () => { if (document.fonts?.ready) await document.fonts.ready; });
-    const png = await page.screenshot({ type: "png", fullPage: false, timeout: relaxed ? 0 : SCREENSHOT_TIMEOUT_MS });
+    const png = await page.screenshot({ type: "png", fullPage: false, timeout: SCREENSHOT_TIMEOUT_MS });
     await page.evaluate(() => document.getElementById("_foldy_heatmap")?.remove());
     return png;
   },
@@ -782,7 +964,6 @@ const PAGE_EVAL = {
 app.get("/health", (_req, res) => res.json({ ok: true, up: true }));
 
 app.post("/render", authMiddleware, async (req, res) => {
-  // default socket timeouts (we may relax later)
   res.setTimeout(HARD_TIMEOUT_MS + 5000);
   req.setTimeout?.(HARD_TIMEOUT_MS + 5000);
 
@@ -790,7 +971,6 @@ app.post("/render", authMiddleware, async (req, res) => {
   const q = req.query || {};
   const body = req.body || {};
 
-  // Per-request relaxed mode (for n8n batches): bypass step watchdogs
   const relaxed =
     (process.env.RENDER_DISABLE_TIMEOUTS === "1") ||
     (String(body.relaxed ?? q.relaxed ?? "0") === "1");
@@ -803,7 +983,6 @@ app.post("/render", authMiddleware, async (req, res) => {
     req.setTimeout?.(long);
   }
 
-  // Params
   const urlRaw = (body.url || q.url || "").trim();
   const deviceKey = (body.device || q.device || "").trim();
   const debugOverlay = parseInt(body.debugOverlay ?? q.debugOverlay ?? 0, 10) === 1;
@@ -827,18 +1006,16 @@ app.post("/render", authMiddleware, async (req, res) => {
       "newContext"
     );
     page = await WT(context.newPage(), 5000, "newPage");
-     await prepPage(page);
-     if (relaxed) {
-       // Disable Playwright’s built-in timeouts for this request
-       page.setDefaultTimeout(0);
-       page.setDefaultNavigationTimeout(0);
-     }
+    await prepPage(page);
+    if (relaxed) {
+      page.setDefaultTimeout(0);
+      page.setDefaultNavigationTimeout(0);
+    }
 
     // Navigate
     const navStart = now();
-     await WT(page.goto(safeUrl, { waitUntil: "domcontentloaded", timeout: relaxed ? 0 : NAV_TIMEOUT_MS }), NAV_TIMEOUT_MS, "page.goto");
+    await WT(page.goto(safeUrl, { waitUntil: "domcontentloaded", timeout: relaxed ? 0 : NAV_TIMEOUT_MS }), NAV_TIMEOUT_MS, "page.goto");
     await page.waitForLoadState("networkidle", { timeout: 5000 }).catch(() => {});
-    // Small wait: late cookie bars often render after idle
     await page.waitForTimeout(700).catch(() => {});
     const navEnd = now();
 
@@ -850,21 +1027,18 @@ app.post("/render", authMiddleware, async (req, res) => {
         asSeenPngBuf = await page.screenshot({ type: "png", fullPage: false, timeout: relaxed ? 0 : SCREENSHOT_TIMEOUT_MS });
       } catch (e) {
         console.warn('[debugOverlay] as-seen failed:', e?.message || e);
-        // continue; not fatal
       }
     }
 
-
     // Pre-hide overlay audit
     const preStart = now();
-     // Pre-scan overlays using WT; soft-fail on timeout/error
-     let pre = { overlayRects: [], overlayElemsMarked: 0, overlayCoveragePct: 0, overlayBlockers: 0, _preHideTimedOut: false };
-     try {
-       pre = await WT(PAGE_EVAL.preHideOverlays(page), HIDE_TIMEOUT_MS, "preHideOverlays");
-     } catch (e) {
-       pre._preHideTimedOut = true;
-       console.warn("[preHideOverlays] soft-fail:", e?.message || e);
-     }
+    let pre = { overlayRects: [], overlayElemsMarked: 0, overlayCoveragePct: 0, overlayBlockers: 0, _preHideTimedOut: false };
+    try {
+      pre = await WT(PAGE_EVAL.preHideOverlays(page), HIDE_TIMEOUT_MS, "preHideOverlays");
+    } catch (e) {
+      pre._preHideTimedOut = true;
+      console.warn("[preHideOverlays] soft-fail:", e?.message || e);
+    }
     const preEnd = now();
 
     // Hide overlays (tagged only)
@@ -879,7 +1053,6 @@ app.post("/render", authMiddleware, async (req, res) => {
 
     // Clean screenshot
     const shotStart = now();
-    // settle webfonts to avoid empty text lines in screenshots
     await page.evaluate(async () => { if (document.fonts?.ready) await document.fonts.ready; });
     const cleanPngBuf = await WT(
       page.screenshot({ type: "png", fullPage: false, timeout: relaxed ? 0 : (SHOT_TIMEOUT_MS - 1000) }),
@@ -887,6 +1060,13 @@ app.post("/render", authMiddleware, async (req, res) => {
       "clean screenshot"
     );
     const shotEnd = now();
+
+    // NEW: Pull CTA TTV (ms) from page (recorded by init script)
+    let ctaTtvMs = await page.evaluate(() => (typeof window._foldyCtaTtvMs === "number" ? Math.max(0, Math.round(window._foldyCtaTtvMs)) : null));
+    // Fallback: if not recorded but CTA is visible now, approximate as time since navStart
+    if ((ctaTtvMs === null || ctaTtvMs === undefined) && ux?.firstCtaInFold) {
+      ctaTtvMs = ms(navStart, now());
+    }
 
     // Heatmap (optional)
     let heatmapBuf = null;
@@ -904,6 +1084,8 @@ app.post("/render", authMiddleware, async (req, res) => {
 
     const nowDate = new Date();
     const payload = {
+      // NEW: echo the requested URL as the first line in the JSON
+      url: safeUrl,
       ts_ms: nowDate.getTime(),
       ts_iso: nowDate.toISOString(),
       serviceVersion: SERVICE_VERSION,
@@ -917,6 +1099,9 @@ app.post("/render", authMiddleware, async (req, res) => {
         overlayCoveragePct: pre.overlayCoveragePct,
         overlayBlockers: pre.overlayBlockers,
         overlayElemsMarked: pre.overlayElemsMarked,
+
+        // NEW: CTA time-to-visibility
+        ctaTtvMs: (typeof ctaTtvMs === "number" ? ctaTtvMs : null),
       },
 
       timings: {
@@ -928,7 +1113,7 @@ app.post("/render", authMiddleware, async (req, res) => {
         screenshot_ms: ms(shotStart, shotEnd),
         total_ms: ms(t0, now()),
       },
-       debugFlags: {
+      debugFlags: {
         preHideTimedOut: pre?._preHideTimedOut === true,
         asSeenFailed: Boolean(debugOverlay && !asSeenPngBuf),
       },
@@ -943,7 +1128,7 @@ app.post("/render", authMiddleware, async (req, res) => {
     if (debugRects) {
       payload.debug = {
         ...rectsForDebug,
-        overlayRects: pre.overlayRects, // <- from pre-hide pass
+        overlayRects: pre.overlayRects,
       };
     }
 
