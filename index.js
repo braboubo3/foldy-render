@@ -1151,6 +1151,44 @@ app.post("/render", authMiddleware, async (req, res) => {
     await page.waitForTimeout(700).catch(() => {});
     const navEnd = now();
 
+    // NEW: 2025-08-27 fast-fail on bot/challenge pages to avoid 90s proxy aborts
+    async function _foldyBotDetect(page) { // NEW
+      try {
+        return await page.evaluate(() => {
+          const t = ((document.title || "") + " " + (document.body?.innerText || "")).toLowerCase();
+          // Cloudflare / common bot challenge phrases
+          const rx = /(just a moment|checking your browser|verify you are human|are you a human|cloudflare|attention required|enable javascript)/i;
+          // Turnstile / hcaptcha markers
+          const hasTurnstile = !!document.querySelector('[data-sitekey][data-callback], iframe[src*="challenges.cloudflare.com"]');
+          const hasHcaptcha  = !!document.querySelector('iframe[src*="hcaptcha.com"], div.h-captcha');
+          return rx.test(t) || hasTurnstile || hasHcaptcha;
+        });
+      } catch {
+        return false;
+      }
+    }
+    
+    try {
+      const botBlocked = await _foldyBotDetect(page); // NEW
+      if (botBlocked) {
+        let asSeenPngBuf = null;
+        try {
+          asSeenPngBuf = await page.screenshot({ type: "png", fullPage: false, timeout: SCREENSHOT_TIMEOUT_MS });
+        } catch (_) {}
+        // Minimal payload; keep shape close to normal error for n8n
+        const blockedPayload = {
+          error: "bot_protection_detected",
+          url: safeUrl,
+          debugFlags: { botProtection: true },
+          timings: { nav_ms: ms(navStart, navEnd) },
+          pngBase64: asSeenPngBuf ? asSeenPngBuf.toString("base64") : undefined
+        };
+        try { await browser.close(); } catch {}
+        return res.status(422).json(blockedPayload);
+      }
+    } catch (_) { /* ignore and proceed */ }
+
+
     // As-seen (optional)
     let asSeenPngBuf = null;
     if (debugOverlay) {
