@@ -487,7 +487,10 @@ const PAGE_EVAL = {
       }
 
 // --- helpers for CTA detection (i18n + nav-toggle exclusion) ---
-function norm(s){ return (s || "").normalize("NFD").replace(/[\u0300-\u036f]/g,"").toLowerCase().trim(); }
+// --- helpers for CTA detection (UPDATED: 2025-08-26 i18n + nav-toggle exclusion) ---
+function norm(s){
+  return (s || "").normalize("NFD").replace(/[\u0300-\u036f]/g,"").toLowerCase().trim();
+}
 function getLang(){
   let l = (document.documentElement.getAttribute("lang") || "").toLowerCase();
   if (!l) {
@@ -497,6 +500,8 @@ function getLang(){
   l = l.split(/[-_]/)[0];
   return ["en","de","fr","es","it","pt"].includes(l) ? l : "en";
 }
+
+// NEW: i18n phrase lexicon
 const LEX = {
   en:{ strong:['buy','add to cart','checkout','order now','subscribe','sign up','get started','start free trial','try free','book demo','schedule demo','contact sales','get quote','request quote','download'],
        weak:['learn more','see more','details','view more','explore','pricing','start now'] },
@@ -511,9 +516,12 @@ const LEX = {
   pt:{ strong:['comprar','adicionar ao carrinho','finalizar compra','assinar','inscrever-se','começar','teste grátis','agendar demo','falar com vendas','obter cotação','baixar'],
        weak:['saiba mais','ver mais','preços'] },
 };
+
+// Intent hints
 const HREF_INTENT = /(checkout|kasse|cart|warenkorb|basket|panier|carrito|carrinho|signup|register|inscription|registrar|pricing|preise|precios|planos|plans|quote|angebot|orcamento|preventivo|contact|kontakt|contato|demo|trial|subscribe|abonnieren|abonnement)/i;
 const CLASS_PRIMARY_HINT = /(btn(-|_)?(primary|cta)|cta(-|_)?btn|button(-|_)?primary|primary(-|_)?button)/i;
 
+// (UNCHANGED) button-ish look heuristic (kept from your file)
 function looksLikeButton(el) {
   const role = (el.getAttribute("role") || "").toLowerCase();
   const type = (el.getAttribute("type") || "").toLowerCase();
@@ -532,7 +540,8 @@ function looksLikeButton(el) {
   return classHit || roleHit || typeHit || (hasBg && rounded);
 }
 
-function isLikelyNavToggle(el) {
+// NEW: ignore hamburger/menu toggles inside <nav>
+function _foldyIsNavToggle(el) {
   const name = norm(el.getAttribute("aria-label") || el.textContent || "");
   const withinNav = !!el.closest("nav,[role='navigation']");
   const cls = norm(el.className || "");
@@ -541,12 +550,13 @@ function isLikelyNavToggle(el) {
   return withinNav && (hasMenuToken || togglesNav);
 }
 
-function hasPhrase(text, list){ const s = norm(text); return list.some(p => s.includes(norm(p))); }
+function _foldyHasPhrase(text, list){ const s = norm(text); return list.some(p => s.includes(norm(p))); }
 
-function isCTA(el) {
+// NEW: canonical CTA predicate
+function _foldyIsCTA(el) {
   if (!el.matches("a,button,[role='button'],input[type='submit']")) return false;
   if (!isVisible(el)) return false;
-  if (isLikelyNavToggle(el)) return false;
+  if (_foldyIsNavToggle(el)) return false;
 
   const lang = getLang();
   const strong = [...LEX.en.strong, ...(LEX[lang]?.strong||[])];
@@ -557,12 +567,25 @@ function isCTA(el) {
   const type  = (el.getAttribute("type") || "").toLowerCase();
   const cls   = el.className || "";
 
-  if (hasPhrase(label, strong)) return true;
-  if (hasPhrase(label, weak) && (CLASS_PRIMARY_HINT.test(cls) || HREF_INTENT.test(href) || type === "submit")) return true;
+  if (_foldyHasPhrase(label, strong)) return true;
+  if (_foldyHasPhrase(label, weak) && (CLASS_PRIMARY_HINT.test(cls) || HREF_INTENT.test(href) || type === "submit")) return true;
   if (!label && HREF_INTENT.test(href) && CLASS_PRIMARY_HINT.test(cls)) return true;
   if (looksLikeButton(el) && (HREF_INTENT.test(href) || type === "submit")) return true;
 
   return false;
+}
+
+// MODIFIED: shim so any legacy call-sites still work
+function hasCtaText(el) {
+  const lang = getLang();
+  const strong = [...LEX.en.strong, ...(LEX[lang]?.strong||[])];
+  const weak   = [...LEX.en.weak,   ...(LEX[lang]?.weak||[])];
+  const t = (el.innerText || el.value || el.getAttribute("aria-label") || el.getAttribute("title") || "");
+  if (_foldyHasPhrase(t, strong)) return true;
+  const href  = (el.getAttribute("href") || "").trim();
+  const type  = (el.getAttribute("type") || "").toLowerCase();
+  const cls   = el.className || "";
+  return _foldyHasPhrase(t, weak) && (CLASS_PRIMARY_HINT.test(cls) || HREF_INTENT.test(href) || type === "submit");
 }
 
 
@@ -672,7 +695,7 @@ function isCTA(el) {
       
         const btns = Array.from(document.querySelectorAll("a,button,[role='button'],input[type='submit']"))
           .filter(isVisible)
-          .filter(isCTA);
+          .filter(_foldyIsCTA);
 
         for (const el of btns) {
           const r = el.getBoundingClientRect();
@@ -769,33 +792,31 @@ function isCTA(el) {
         return Array.from(covered.values()).sort((a, b) => a - b);
       }
 
-      function ctaDetection() {
-        const candidates = Array.from(document.querySelectorAll("a,button,[role='button'],input[type='submit']"))
-          .filter(isVisible)
-          .filter(isCTA)
-          .map(el => {
-            const r = el.getBoundingClientRect();
-            const text = (el.innerText || el.value || el.getAttribute("aria-label") || el.getAttribute("title") || "").trim();
-            const href = el.getAttribute("href") || "";
-            // heuristic: if text matches strong lexicon -> primary, else secondary
-            const lang = getLang();
-            const strong = [...LEX.en.strong, ...(LEX[lang]?.strong||[])];
-            const kind = hasPhrase(text, strong) ? "primary" : "secondary";
-            return { el, r, text, href, kind };
-          });
-      
-        // first CTA fully inside the fold (top-most)
-        const inFold = candidates.filter(c => c.r.top >= 0 && c.r.bottom <= window.innerHeight)
-                                 .sort((a,b) => a.r.top - b.r.top);
-        const first = inFold[0] || null;
-      
-        return {
-          firstCtaInFold: !!first,
-          ctaText: first?.text || null,
-          ctaKind: first?.kind || null,
-          ctaCandidatesCount: candidates.length
-        };
-      }
+    function ctaDetection() {
+      const nodes = Array.from(document.querySelectorAll("a,button,[role='button'],input[type='submit']"))
+        .filter(isVisible)
+        .filter(_foldyIsCTA)
+        .map(el => {
+          const r = el.getBoundingClientRect();
+          const text = (el.innerText || el.value || el.getAttribute("aria-label") || el.getAttribute("title") || "").trim();
+          const lang = getLang();
+          const strong = [...LEX.en.strong, ...(LEX[lang]?.strong||[])];
+          const kind = _foldyHasPhrase(text, strong) ? "primary" : "secondary";
+          return { el, r, text, kind };
+        });
+    
+      const inFold = nodes.filter(n => n.r.top >= 0 && n.r.bottom <= window.innerHeight)
+                          .sort((a,b) => a.r.top - b.r.top);
+      const first = inFold[0] || null;
+    
+      return {
+        firstCtaInFold: !!first,
+        ctaText: first?.text || null,
+        ctaKind: first?.kind || null,
+        ctaCandidatesCount: nodes.length
+      };
+    }
+
 
 
       function foldFontStats() {
@@ -976,7 +997,7 @@ function isCTA(el) {
       const fixedHeaderPctVal = fixedHeaderPct();
 
       // NEW — CTA contrast
-      const ctaNodes = Array.from(document.querySelectorAll("a,button,[role='button']")).filter((el) => (hasCtaText(el) || looksLikeButton(el)));
+      const ctaNodes = Array.from(document.querySelectorAll("a,button,[role='button'],input[type='submit']")).filter(_foldyIsCTA);
       const ctaContrastMin = minCtaContrastInFold(ctaNodes);
       const ctaContrastFail = (ctaContrastMin !== null) ? (ctaContrastMin < 4.5) : false;
 
