@@ -232,102 +232,150 @@ async function prepPage(page) {
     } catch {}
   });
 
-  // NEW: CTA TTV watcher (starts at earliest script run)
-  await page.addInitScript(() => {
-    (function () {
-      try {
-        const t0 = performance.now();
-        const CTA_PHRASES = [
-          "get started","start now","request a demo","book a demo","request demo",
-          "buy","add to cart","sign up","log in","subscribe","try","contact","learn more",
-          "demander une demo","demander une démo","essayer","nous contacter","en savoir plus",
-          "commencer","acheter","ajouter au panier","reserver","réserver","s'inscrire","se connecter",
-          "demo anfordern","jetzt starten","kaufen","in den warenkorb","buchen","registrieren","anmelden","testen","kontakt","mehr erfahren",
-          "solicitar una demo","empezar","comprar","añadir al carrito","reservar","regístrate","iniciar sesion","iniciar sesión","probar","contacto","mas informacion","más información",
-          "solicitar uma demo","comecar","começar","comprar","adicionar ao carrinho","reservar","inscrever-se","entrar","experimentar","contato","saiba mais",
-          "richiedi una demo","inizia","compra","aggiungi al carrello","prenota","iscriviti","accedi","prova","contattaci","scopri di piu","scopri di più"
-        ];
-        const norm = (t) => (t||"").toLowerCase().normalize("NFD").replace(/[\u0300-\u036f]/g,"");
-        const isVisible = (el) => {
-          const cs = getComputedStyle(el);
-          if (cs.visibility === "hidden" || cs.display === "none" || parseFloat(cs.opacity||"1") < 0.05) return false;
-          const r = el.getBoundingClientRect();
-          return r.width > 0 && r.height > 0;
-        };
-        const looksLikeButton = (el) => {
-          const role = (el.getAttribute("role") || "").toLowerCase();
-          const type = (el.getAttribute("type") || "").toLowerCase();
-          const cls  = (el.className || "").toString().toLowerCase();
-          const id   = (el.id || "").toLowerCase();
-          const classHit = /\b(btn|button|cta|primary|pill|calltoaction|call-to-action)\b/.test(cls)
-                        || /\b(btn|button|cta|primary|pill)\b/.test(id)
-                        || /\b(btn-|button-|cta-|primary-)/.test(cls);
-          const cs = getComputedStyle(el);
-          const hasBg = cs.backgroundColor && cs.backgroundColor !== "rgba(0, 0, 0, 0)" && cs.backgroundColor !== "transparent";
-          const radius = ["borderTopLeftRadius","borderTopRightRadius","borderBottomLeftRadius","borderBottomRightRadius"]
-            .map(k => parseFloat(cs[k] || "0")).reduce((a,b)=>a+b,0);
-          const rounded = radius >= 12;
-          return classHit || role === "button" || type === "button" || type === "submit" || (hasBg && rounded);
-        };
-        const isCTA = (el) => {
-          if (!el.matches || !el.matches("a,button,[role='button']")) return false;
-          if (!isVisible(el)) return false;
-          const txt = norm(el.innerText || "");
-          const phrase = txt.length > 2 && CTA_PHRASES.some(p => txt.includes(p));
-          return phrase || looksLikeButton(el);
-        };
-        let done = false;
-        const mark = () => {
-          if (done) return;
-          done = true;
-          window._foldyCtaTtvMs = Math.max(0, Math.round(performance.now() - t0));
-        };
-        // IO to detect entry into viewport
-        const io = new IntersectionObserver((entries) => {
-          for (const e of entries) {
-            if (e.isIntersecting) { mark(); break; }
+// NEW: CTA TTV watcher (starts at earliest script run)
+await page.addInitScript(() => {
+  (function () {
+    try {
+      const t0 = performance.now();
+
+      // --- utils & i18n lexicon ---
+      function norm(s){ return (s || "").normalize("NFD").replace(/[\u0300-\u036f]/g,"").toLowerCase().trim(); }
+      function getLang(){
+        let l = (document.documentElement.getAttribute("lang") || "").toLowerCase();
+        if (!l) {
+          const m = document.querySelector('meta[http-equiv="content-language"], meta[name="language"], meta[property="og:locale"]');
+          l = (m?.getAttribute("content") || "").toLowerCase();
+        }
+        l = l.split(/[-_]/)[0];
+        return ["en","de","fr","es","it","pt"].includes(l) ? l : "en";
+      }
+      const LEX = {
+        en:{ strong:['buy','add to cart','checkout','order now','subscribe','sign up','get started','start free trial','try free','book demo','schedule demo','contact sales','get quote','request quote','download'],
+             weak:['learn more','see more','details','view more','explore','pricing','start now'] },
+        de:{ strong:['kaufen','in den warenkorb','zur kasse','jetzt kaufen','bestellen','abonnieren','anmelden','registrieren','loslegen','kostenlos testen','probe starten','demo buchen','demo vereinbaren','vertrieb kontaktieren','angebot anfordern','preis anfragen','herunterladen'],
+             weak:['mehr erfahren','details','preise','jetzt starten'] },
+        fr:{ strong:['acheter','ajouter au panier','passer au paiement','commander','sabonner','sinscrire','inscription','commencer','essai gratuit','demander une demo','réserver une demo','contacter les ventes','obtenir un devis','télécharger'],
+             weak:['en savoir plus','voir plus','tarifs'] },
+        es:{ strong:['comprar','añadir al carrito','ir a caja','pagar','suscribirse','regístrate','empezar','prueba gratis','reservar demo','pedir presupuesto','descargar'],
+             weak:['saber más','ver más','precios'] },
+        it:{ strong:['compra','aggiungi al carrello','cassa','ordina','abbonati','registrati','inizia','prova gratis','prenota demo','contatta vendite','richiedi preventivo','scarica'],
+             weak:['scopri di più','vedi di più','prezzi'] },
+        pt:{ strong:['comprar','adicionar ao carrinho','finalizar compra','assinar','inscrever-se','começar','teste grátis','agendar demo','falar com vendas','obter cotação','baixar'],
+             weak:['saiba mais','ver mais','preços'] },
+      };
+      const HREF_INTENT = /(checkout|kasse|cart|warenkorb|basket|panier|carrito|carrinho|signup|register|inscription|registrar|pricing|preise|precios|planos|plans|quote|angebot|orcamento|preventivo|contact|kontakt|contato|demo|trial|subscribe|abonnieren|abonnement)/i;
+      const CLASS_PRIMARY_HINT = /(btn(-|_)?(primary|cta)|cta(-|_)?btn|button(-|_)?primary|primary(-|_)?button)/i;
+
+      const lang = getLang();
+
+      // --- visibility + shape helpers from your original code ---
+      const isVisible = (el) => {
+        const cs = getComputedStyle(el);
+        if (cs.visibility === "hidden" || cs.display === "none" || parseFloat(cs.opacity||"1") < 0.05) return false;
+        const r = el.getBoundingClientRect();
+        return r.width > 0 && r.height > 0;
+      };
+      const looksLikeButton = (el) => {
+        const role = (el.getAttribute("role") || "").toLowerCase();
+        const type = (el.getAttribute("type") || "").toLowerCase();
+        const cls  = (el.className || "").toString().toLowerCase();
+        const id   = (el.id || "").toLowerCase();
+        const classHit = /\b(btn|button|cta|primary|pill|calltoaction|call-to-action)\b/.test(cls)
+                      || /\b(btn|button|cta|primary|pill)\b/.test(id)
+                      || /\b(btn-|button-|cta-|primary-)/.test(cls);
+        const cs = getComputedStyle(el);
+        const hasBg = cs.backgroundColor && cs.backgroundColor !== "rgba(0, 0, 0, 0)" && cs.backgroundColor !== "transparent";
+        const radius = ["borderTopLeftRadius","borderTopRightRadius","borderBottomLeftRadius","borderBottomRightRadius"]
+          .map(k => parseFloat(cs[k] || "0")).reduce((a,b)=>a+b,0);
+        const rounded = radius >= 12;
+        return classHit || role === "button" || type === "button" || type === "submit" || (hasBg && rounded);
+      };
+
+      // --- new: drop hamburgers/nav toggles ---
+      function isLikelyNavToggle(el) {
+        const name = norm(el.getAttribute("aria-label") || el.textContent || "");
+        const withinNav = !!el.closest("nav,[role='navigation']");
+        const cls = norm(el.className || "");
+        const hasMenuToken = ["menu","menü","hamburger"].some(t => name.includes(t) || cls.includes(t));
+        const togglesNav = el.hasAttribute("aria-expanded") || el.hasAttribute("aria-controls");
+        return withinNav && (hasMenuToken || togglesNav);
+      }
+
+      function hasPhrase(text, list){ const s = norm(text); return list.some(p => s.includes(norm(p))); }
+
+      // --- main CTA classifier used by TTV watcher ---
+      function isCTA(el) {
+        if (!el.matches || !el.matches("a,button,[role='button'],input[type='submit']")) return false;
+        if (!isVisible(el)) return false;
+        if (isLikelyNavToggle(el)) return false;
+
+        const label = (el.innerText || el.value || el.getAttribute("aria-label") || el.getAttribute("title") || "").trim();
+        const href = (el.getAttribute("href") || "").trim();
+        const type = (el.getAttribute("type") || "").toLowerCase();
+        const cls  = el.className || "";
+
+        const strong = [...LEX.en.strong, ...(LEX[lang]?.strong||[])];
+        const weak   = [...LEX.en.weak,   ...(LEX[lang]?.weak||[])];
+
+        if (hasPhrase(label, strong)) return true;
+        if (hasPhrase(label, weak) && (CLASS_PRIMARY_HINT.test(cls) || HREF_INTENT.test(href) || type === "submit")) return true;
+        if (!label && HREF_INTENT.test(href) && CLASS_PRIMARY_HINT.test(cls)) return true; // icon-only
+
+        // last resort: visually button + clear intent in href or submit
+        if (looksLikeButton(el) && (HREF_INTENT.test(href) || type === "submit")) return true;
+
+        return false;
+      }
+
+      let done = false;
+      const mark = () => {
+        if (done) return;
+        done = true;
+        window._foldyCtaTtvMs = Math.max(0, Math.round(performance.now() - t0));
+      };
+
+      const io = new IntersectionObserver((entries) => {
+        for (const e of entries) {
+          if (e.isIntersecting) { mark(); break; }
+        }
+      }, { root: null, threshold: [0, 0.01] });
+
+      const seed = () => {
+        document.querySelectorAll("a,button,[role='button'],input[type='submit']").forEach((el) => { if (isCTA(el)) io.observe(el); });
+      };
+      const mo = new MutationObserver((muts) => {
+        for (const m of muts) for (const n of m.addedNodes) {
+          if (n.nodeType !== 1) continue;
+          const el = n;
+          if (isCTA(el)) io.observe(el);
+          el.querySelectorAll?.("a,button,[role='button'],input[type='submit']").forEach((c) => { if (isCTA(c)) io.observe(c); });
+        }
+      });
+
+      document.addEventListener("DOMContentLoaded", seed, { once: true });
+      try { seed(); } catch {}
+      try { mo.observe(document.documentElement, { childList: true, subtree: true }); } catch {}
+
+      setTimeout(() => {
+        try {
+          if (!window._foldyCtaTtvMs) {
+            const any = Array.from(document.querySelectorAll("a,button,[role='button'],input[type='submit']")).some((el) => {
+              if (!isCTA(el)) return false;
+              const r = el.getBoundingClientRect();
+              return r.top < innerHeight && r.bottom > 0 && r.left < innerWidth && r.right > 0;
+            });
+            if (any) mark();
           }
-        }, { root: null, threshold: [0, 0.01] });
+        } catch {}
+      }, 3000);
 
-        // Seed & watch DOM
-        const seed = () => {
-          document.querySelectorAll("a,button,[role='button']").forEach((el) => { if (isCTA(el)) io.observe(el); });
-        };
-        const mo = new MutationObserver((muts) => {
-          for (const m of muts) for (const n of m.addedNodes) {
-            if (n.nodeType !== 1) continue;
-            const el = n;
-            if (isCTA(el)) io.observe(el);
-            el.querySelectorAll?.("a,button,[role='button']").forEach((c) => { if (isCTA(c)) io.observe(c); });
-          }
-        });
-
-        document.addEventListener("DOMContentLoaded", seed, { once: true });
-        try { seed(); } catch {}
-        try { mo.observe(document.documentElement, { childList: true, subtree: true }); } catch {}
-
-        // Fallback: if already visible soon after load
-        setTimeout(() => {
-          try {
-            if (!window._foldyCtaTtvMs) {
-              const any = Array.from(document.querySelectorAll("a,button,[role='button']")).some((el) => {
-                if (!isCTA(el)) return false;
-                const r = el.getBoundingClientRect();
-                return r.top < innerHeight && r.bottom > 0 && r.left < innerWidth && r.right > 0;
-              });
-              if (any) mark();
-            }
-          } catch {}
-        }, 3000);
-
-        // Hard cap to avoid watchers lingering forever
-        setTimeout(() => {
-          if (!window._foldyCtaTtvMs) window._foldyCtaTtvMs = Math.max(0, Math.round(performance.now() - t0));
-          io.disconnect?.(); mo.disconnect?.();
-        }, 30000);
-      } catch {}
-    })();
-  });
+      setTimeout(() => {
+        if (!window._foldyCtaTtvMs) window._foldyCtaTtvMs = Math.max(0, Math.round(performance.now() - t0));
+        io.disconnect?.(); mo.disconnect?.();
+      }, 30000);
+    } catch {}
+  })();
+});
   // END NEW: CTA TTV watcher
 
   page.setDefaultTimeout(15000);
@@ -438,43 +486,85 @@ const PAGE_EVAL = {
         return true;
       }
 
-      // --- helpers for CTA detection ---
-      function norm(t) {
-        return (t || "")
-          .toLowerCase()
-          .normalize("NFD").replace(/[\u0300-\u036f]/g, "");
-      }
-      const CTA_PHRASES = [
-        "get started","start now","request a demo","book a demo","request demo",
-        "buy","add to cart","sign up","log in","subscribe","try","contact","learn more",
-        "demander une demo","demander une démo","essayer","nous contacter","en savoir plus",
-        "commencer","acheter","ajouter au panier","reserver","réserver","s'inscrire","se connecter",
-        "demo anfordern","jetzt starten","kaufen","in den warenkorb","buchen","registrieren","anmelden","testen","kontakt","mehr erfahren",
-        "solicitar una demo","empezar","comprar","añadir al carrito","reservar","regístrate","iniciar sesion","iniciar sesión","probar","contacto","mas informacion","más información",
-        "solicitar uma demo","comecar","começar","comprar","adicionar ao carrinho","reservar","inscrever-se","entrar","experimentar","contato","saiba mais",
-        "richiedi una demo","inizia","compra","aggiungi al carrello","prenota","iscriviti","accedi","prova","contattaci","scopri di piu","scopri di più"
-      ];
-      function hasCtaText(el) {
-        const t = norm(el.innerText || "");
-        return t.length > 2 && CTA_PHRASES.some(p => t.includes(p));
-      }
-      function looksLikeButton(el) {
-        const role = (el.getAttribute("role") || "").toLowerCase();
-        const type = (el.getAttribute("type") || "").toLowerCase();
-        const cls = (el.className || "").toString().toLowerCase();
-        const id = (el.id || "").toLowerCase();
-        const classHit = /\b(btn|button|cta|primary|pill|calltoaction|call-to-action)\b/.test(cls)
-                      || /\b(btn|button|cta|primary|pill)\b/.test(id)
-                      || /\b(btn-|button-|cta-|primary-)/.test(cls);
-        const roleHit  = role === "button";
-        const typeHit  = type === "button" || type === "submit";
-        const cs = getComputedStyle(el);
-        const hasBg = cs.backgroundColor && cs.backgroundColor !== "rgba(0, 0, 0, 0)" && cs.backgroundColor !== "transparent";
-        const radius = ["borderTopLeftRadius","borderTopRightRadius","borderBottomLeftRadius","borderBottomRightRadius"]
-          .map(k => parseFloat(cs[k] || "0")).reduce((a,b)=>a+b,0);
-        const rounded = radius >= 12;
-        return classHit || roleHit || typeHit || (hasBg && rounded);
-      }
+// --- helpers for CTA detection (i18n + nav-toggle exclusion) ---
+function norm(s){ return (s || "").normalize("NFD").replace(/[\u0300-\u036f]/g,"").toLowerCase().trim(); }
+function getLang(){
+  let l = (document.documentElement.getAttribute("lang") || "").toLowerCase();
+  if (!l) {
+    const m = document.querySelector('meta[http-equiv="content-language"], meta[name="language"], meta[property="og:locale"]');
+    l = (m?.getAttribute("content") || "").toLowerCase();
+  }
+  l = l.split(/[-_]/)[0];
+  return ["en","de","fr","es","it","pt"].includes(l) ? l : "en";
+}
+const LEX = {
+  en:{ strong:['buy','add to cart','checkout','order now','subscribe','sign up','get started','start free trial','try free','book demo','schedule demo','contact sales','get quote','request quote','download'],
+       weak:['learn more','see more','details','view more','explore','pricing','start now'] },
+  de:{ strong:['kaufen','in den warenkorb','zur kasse','jetzt kaufen','bestellen','abonnieren','anmelden','registrieren','loslegen','kostenlos testen','demo buchen','demo vereinbaren','vertrieb kontaktieren','angebot anfordern','preis anfragen','herunterladen'],
+       weak:['mehr erfahren','details','preise','jetzt starten'] },
+  fr:{ strong:['acheter','ajouter au panier','passer au paiement','commander','sabonner','sinscrire','inscription','commencer','essai gratuit','demander une demo','réserver une demo','contacter les ventes','obtenir un devis','télécharger'],
+       weak:['en savoir plus','voir plus','tarifs'] },
+  es:{ strong:['comprar','añadir al carrito','ir a caja','pagar','suscribirse','regístrate','empezar','prueba gratis','reservar demo','pedir presupuesto','descargar'],
+       weak:['saber más','ver más','precios'] },
+  it:{ strong:['compra','aggiungi al carrello','cassa','ordina','abbonati','registrati','inizia','prova gratis','prenota demo','contatta vendite','richiedi preventivo','scarica'],
+       weak:['scopri di più','vedi di più','prezzi'] },
+  pt:{ strong:['comprar','adicionar ao carrinho','finalizar compra','assinar','inscrever-se','começar','teste grátis','agendar demo','falar com vendas','obter cotação','baixar'],
+       weak:['saiba mais','ver mais','preços'] },
+};
+const HREF_INTENT = /(checkout|kasse|cart|warenkorb|basket|panier|carrito|carrinho|signup|register|inscription|registrar|pricing|preise|precios|planos|plans|quote|angebot|orcamento|preventivo|contact|kontakt|contato|demo|trial|subscribe|abonnieren|abonnement)/i;
+const CLASS_PRIMARY_HINT = /(btn(-|_)?(primary|cta)|cta(-|_)?btn|button(-|_)?primary|primary(-|_)?button)/i;
+
+function looksLikeButton(el) {
+  const role = (el.getAttribute("role") || "").toLowerCase();
+  const type = (el.getAttribute("type") || "").toLowerCase();
+  const cls = (el.className || "").toString().toLowerCase();
+  const id = (el.id || "").toLowerCase();
+  const classHit = /\b(btn|button|cta|primary|pill|calltoaction|call-to-action)\b/.test(cls)
+                || /\b(btn|button|cta|primary|pill)\b/.test(id)
+                || /\b(btn-|button-|cta-|primary-)/.test(cls);
+  const roleHit  = role === "button";
+  const typeHit  = type === "button" || type === "submit";
+  const cs = getComputedStyle(el);
+  const hasBg = cs.backgroundColor && cs.backgroundColor !== "rgba(0, 0, 0, 0)" && cs.backgroundColor !== "transparent";
+  const radius = ["borderTopLeftRadius","borderTopRightRadius","borderBottomLeftRadius","borderBottomRightRadius"]
+    .map(k => parseFloat(cs[k] || "0")).reduce((a,b)=>a+b,0);
+  const rounded = radius >= 12;
+  return classHit || roleHit || typeHit || (hasBg && rounded);
+}
+
+function isLikelyNavToggle(el) {
+  const name = norm(el.getAttribute("aria-label") || el.textContent || "");
+  const withinNav = !!el.closest("nav,[role='navigation']");
+  const cls = norm(el.className || "");
+  const hasMenuToken = ["menu","menü","hamburger"].some(t => name.includes(t) || cls.includes(t));
+  const togglesNav = el.hasAttribute("aria-expanded") || el.hasAttribute("aria-controls");
+  return withinNav && (hasMenuToken || togglesNav);
+}
+
+function hasPhrase(text, list){ const s = norm(text); return list.some(p => s.includes(norm(p))); }
+
+function isCTA(el) {
+  if (!el.matches("a,button,[role='button'],input[type='submit']")) return false;
+  if (!isVisible(el)) return false;
+  if (isLikelyNavToggle(el)) return false;
+
+  const lang = getLang();
+  const strong = [...LEX.en.strong, ...(LEX[lang]?.strong||[])];
+  const weak   = [...LEX.en.weak,   ...(LEX[lang]?.weak||[])];
+
+  const label = (el.innerText || el.value || el.getAttribute("aria-label") || el.getAttribute("title") || "").trim();
+  const href  = (el.getAttribute("href") || "").trim();
+  const type  = (el.getAttribute("type") || "").toLowerCase();
+  const cls   = el.className || "";
+
+  if (hasPhrase(label, strong)) return true;
+  if (hasPhrase(label, weak) && (CLASS_PRIMARY_HINT.test(cls) || HREF_INTENT.test(href) || type === "submit")) return true;
+  if (!label && HREF_INTENT.test(href) && CLASS_PRIMARY_HINT.test(cls)) return true;
+  if (looksLikeButton(el) && (HREF_INTENT.test(href) || type === "submit")) return true;
+
+  return false;
+}
+
 
       // --- Rect collectors (text/media/cta/hero) ---
       function rectsForTextNodes() {
@@ -579,10 +669,10 @@ const PAGE_EVAL = {
         const capArea = 0.06 * foldArea; // ≤6% per CTA
         const minDim  = 32;
         const minArea = 0.015 * foldArea;
-
-        const btns = Array.from(document.querySelectorAll("a,button,[role='button']"))
+      
+        const btns = Array.from(document.querySelectorAll("a,button,[role='button'],input[type='submit']"))
           .filter(isVisible)
-          .filter((el) => hasCtaText(el) || looksLikeButton(el));
+          .filter(isCTA);
 
         for (const el of btns) {
           const r = el.getBoundingClientRect();
@@ -680,16 +770,33 @@ const PAGE_EVAL = {
       }
 
       function ctaDetection() {
-        const candidates = Array.from(document.querySelectorAll("a,button,[role='button']"))
+        const candidates = Array.from(document.querySelectorAll("a,button,[role='button'],input[type='submit']"))
           .filter(isVisible)
-          .filter(el => hasCtaText(el) || looksLikeButton(el));
-        let firstInFold = false;
-        for (const el of candidates) {
-          const r = el.getBoundingClientRect();
-          if (r.top >= 0 && r.bottom <= window.innerHeight) { firstInFold = true; break; }
-        }
-        return { firstCtaInFold: firstInFold, ctaCandidatesCount: candidates.length };
+          .filter(isCTA)
+          .map(el => {
+            const r = el.getBoundingClientRect();
+            const text = (el.innerText || el.value || el.getAttribute("aria-label") || el.getAttribute("title") || "").trim();
+            const href = el.getAttribute("href") || "";
+            // heuristic: if text matches strong lexicon -> primary, else secondary
+            const lang = getLang();
+            const strong = [...LEX.en.strong, ...(LEX[lang]?.strong||[])];
+            const kind = hasPhrase(text, strong) ? "primary" : "secondary";
+            return { el, r, text, href, kind };
+          });
+      
+        // first CTA fully inside the fold (top-most)
+        const inFold = candidates.filter(c => c.r.top >= 0 && c.r.bottom <= window.innerHeight)
+                                 .sort((a,b) => a.r.top - b.r.top);
+        const first = inFold[0] || null;
+      
+        return {
+          firstCtaInFold: !!first,
+          ctaText: first?.text || null,
+          ctaKind: first?.kind || null,
+          ctaCandidatesCount: candidates.length
+        };
       }
+
 
       function foldFontStats() {
         const els = Array.from(document.querySelectorAll("body *")).filter(isVisible);
@@ -856,7 +963,7 @@ const PAGE_EVAL = {
       const foldCoveragePct = Math.round((coveredCells.length / (GRID_ROWS * GRID_COLS)) * 100);
       const paintedCoveragePct = 100; // reserved
 
-      const { firstCtaInFold, ctaCandidatesCount } = ctaDetection();
+      const { firstCtaInFold, ctaText, ctaKind, ctaCandidatesCount } = ctaDetection();
       const { minFontPx, maxFontPx } = foldFontStats();
 
       // NEW — Safe-area risk bands (heuristic heights)
@@ -883,7 +990,7 @@ const PAGE_EVAL = {
           minFontPx,
           smallTapTargets: small.count,
           hasViewportMeta: hasViewportMeta(),
-
+        
           // NEW fields
           viewportFitCover,
           usesSafeAreaCSS,
@@ -892,7 +999,11 @@ const PAGE_EVAL = {
           fixedHeaderPct: fixedHeaderPctVal,
           ctaContrastMin: (ctaContrastMin !== null ? Number(ctaContrastMin.toFixed(2)) : null),
           ctaContrastFail,
-          ctaCandidatesCount
+          ctaCandidatesCount,
+        
+          // NEW: expose CTA text + kind (for debugging & UX)
+          ctaText,
+          ctaKind
         },
         debugRects: {
           rows: GRID_ROWS,
