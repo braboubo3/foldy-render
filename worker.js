@@ -58,7 +58,11 @@ async function getBrowser() {
 
 // RPC: claim next queued job (requires you created the function)
 async function claimJob() {
-  const { data, error } = await sb.rpc("claim_screenshot_job", { p_worker_id: randomUUID() });
+  const maxAttempts = parseInt(process.env.WORKER_MAX_ATTEMPTS || "3", 10);
+  const { data, error } = await sb.rpc("claim_screenshot_job", {
+    p_worker_id: randomUUID(),
+    p_max_attempts: maxAttempts
+  });
   if (error) {
     console.error("[worker] claim error:", error);
     return null;
@@ -82,7 +86,7 @@ async function processJob(job) {
   const ctx = await b.newContext(deviceOpts(job.device));
   const page = await ctx.newPage();
   try {
-
+  console.log(`[worker] processing ${job.id} attempt=${job.attempt} device=${job.device}`);
     // 1) Navigate (harden URL type)
     let targetUrl = null;
     if (typeof job.url === "string") {
@@ -93,7 +97,12 @@ async function processJob(job) {
     } else {
       throw new Error(`invalid_job_url: expected string, got ${typeof job.url}`);
     }
-    await page.goto(targetUrl, { waitUntil: "domcontentloaded", timeout: 25000 });
+     const targetUrl = _coerceUrl(job.url);
+     if (!targetUrl) {
+       throw new Error(`invalid_job_url: got ${typeof job.url} value=${JSON.stringify(job.url).slice(0,200)}`);
+     }
+     console.log(`[worker] processing ${job.id} device=${job.device} url=${targetUrl}`);
+     await page.goto(targetUrl, { waitUntil: "domcontentloaded", timeout: 25000 });
 
     await page.waitForLoadState("networkidle", { timeout: 4000 }).catch(() => {});
     await page.waitForTimeout(500).catch(() => {});
@@ -110,6 +119,22 @@ async function processJob(job) {
         } catch {}
       }
     });
+
+    // NEW: 2025-08-28 — accept string or object; extract the first http(s) URL
+    function _coerceUrl(u) {
+      if (!u) return null;
+      if (typeof u === "string") return u;
+      // common shapes: {url: "..."} or {href: "..."}
+      if (typeof u.url === "string") return u.url;
+      if (typeof u.href === "string") return u.href;
+      // Last resort: scan the JSON for an http(s) URL
+      try {
+        const s = JSON.stringify(u);
+        const m = s.match(/https?:\/\/[^\s"']+/i);
+        if (m) return m[0];
+      } catch {}
+      return null;
+    }
 
     // 3) Cap webfont wait to 1.5s
     await page.evaluate(async (capMs) => {
