@@ -1379,7 +1379,7 @@ app.post("/render", authMiddleware, async (req, res) => {
         audit_ms: ms(preStart, preEnd),
         hide_ms: ms(hideStart, hideEnd),
         clean_ms: ms(cleanStart, cleanEnd),
-        screenshot_ms: ms(shotStart, shotEnd),
+        screenshot_ms: 0,
         total_ms: ms(t0, now()),
       },
       debugFlags: {
