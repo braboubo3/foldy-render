@@ -10,6 +10,7 @@ const SUPABASE_BUCKET = process.env.SUPABASE_BUCKET || "screenshot";
 const WORKER_SLEEP_MS = parseInt(process.env.WORKER_SLEEP_MS || "1500", 10);
 const BROWSER_ARGS = ["--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu"];
 const RECYCLE_EVERY_N_JOBS = parseInt(process.env.WORKER_BROWSER_RECYCLE_N || "50", 10);
+const MAX_ATTEMPTS = parseInt(process.env.WORKER_MAX_ATTEMPTS || "3", 10);
 
 if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE) {
   console.error("[worker] Missing SUPABASE_URL or SUPABASE_SERVICE_ROLE");
@@ -19,7 +20,7 @@ const sb = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE, { auth: { persistSe
 
 const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 
-// Minimal device map (matches API). Extend as needed.
+// --- Devices (trim as needed)
 const DEVICES = {
   iphone_15_pro: { viewport: { width: 393, height: 852 }, dpr: 3, mobile: true,
     ua: "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1" },
@@ -43,7 +44,21 @@ function deviceOpts(key) {
   };
 }
 
-// Persistent browser with periodic recycle
+// --- URL coercer (accept string | {url}|{href} | search first http(s) in JSON)
+function _coerceUrl(u) {
+  if (!u) return null;
+  if (typeof u === "string") return u;
+  if (typeof u.url === "string") return u.url;
+  if (typeof u.href === "string") return u.href;
+  try {
+    const s = JSON.stringify(u);
+    const m = s.match(/https?:\/\/[^\s"']+/i);
+    if (m) return m[0];
+  } catch {}
+  return null;
+}
+
+// --- Persistent browser with periodic recycle
 let browser = null;
 let jobsSinceLaunch = 0;
 async function getBrowser() {
@@ -56,12 +71,11 @@ async function getBrowser() {
   return browser;
 }
 
-// RPC: claim next queued job (requires you created the function)
+// --- RPC: claim next queued job (single canonical function with p_max_attempts)
 async function claimJob() {
-  const maxAttempts = parseInt(process.env.WORKER_MAX_ATTEMPTS || "3", 10);
   const { data, error } = await sb.rpc("claim_screenshot_job", {
     p_worker_id: randomUUID(),
-    p_max_attempts: maxAttempts
+    p_max_attempts: MAX_ATTEMPTS
   });
   if (error) {
     console.error("[worker] claim error:", error);
@@ -86,28 +100,18 @@ async function processJob(job) {
   const ctx = await b.newContext(deviceOpts(job.device));
   const page = await ctx.newPage();
   try {
-  console.log(`[worker] processing ${job.id} attempt=${job.attempt} device=${job.device}`);
-    // 1) Navigate (harden URL type)
-    let targetUrl = null;
-    if (typeof job.url === "string") {
-      targetUrl = job.url;
-    } else if (job?.url && typeof job.url.url === "string") {
-      // Some enqueuers accidentally store the whole body as "url"
-      targetUrl = job.url.url;
-    } else {
-      throw new Error(`invalid_job_url: expected string, got ${typeof job.url}`);
+    const targetUrl = _coerceUrl(job.url);
+    if (!targetUrl) {
+      throw new Error(`invalid_job_url: got ${typeof job.url} value=${JSON.stringify(job.url).slice(0,200)}`);
     }
-     const targetUrl = _coerceUrl(job.url);
-     if (!targetUrl) {
-       throw new Error(`invalid_job_url: got ${typeof job.url} value=${JSON.stringify(job.url).slice(0,200)}`);
-     }
-     console.log(`[worker] processing ${job.id} device=${job.device} url=${targetUrl}`);
-     await page.goto(targetUrl, { waitUntil: "domcontentloaded", timeout: 25000 });
+    console.log(`[worker] processing ${job.id} attempt=${job.attempt} device=${job.device} url=${targetUrl}`);
 
+    // 1) Navigate
+    await page.goto(targetUrl, { waitUntil: "domcontentloaded", timeout: 25000 });
     await page.waitForLoadState("networkidle", { timeout: 4000 }).catch(() => {});
     await page.waitForTimeout(500).catch(() => {});
 
-    // 2) Hide overlays (minimal; extend with your real logic if needed)
+    // 2) Hide overlays (minimal; extend to match API’s clean)
     await page.evaluate(() => {
       const sel = '[role="dialog"], .modal, .popup, [data-cookiebanner], [id*="cookie"]';
       for (const el of Array.from(document.querySelectorAll(sel))) {
@@ -119,22 +123,6 @@ async function processJob(job) {
         } catch {}
       }
     });
-
-    // NEW: 2025-08-28 — accept string or object; extract the first http(s) URL
-    function _coerceUrl(u) {
-      if (!u) return null;
-      if (typeof u === "string") return u;
-      // common shapes: {url: "..."} or {href: "..."}
-      if (typeof u.url === "string") return u.url;
-      if (typeof u.href === "string") return u.href;
-      // Last resort: scan the JSON for an http(s) URL
-      try {
-        const s = JSON.stringify(u);
-        const m = s.match(/https?:\/\/[^\s"']+/i);
-        if (m) return m[0];
-      } catch {}
-      return null;
-    }
 
     // 3) Cap webfont wait to 1.5s
     await page.evaluate(async (capMs) => {
@@ -200,10 +188,7 @@ async function main() {
       console.error("[worker] claim threw:", e);
       job = null;
     }
-    if (!job) {
-      await sleep(WORKER_SLEEP_MS);
-      continue;
-    }
+    if (!job) { await sleep(WORKER_SLEEP_MS); continue; }
     await processJob(job);
   }
 }
