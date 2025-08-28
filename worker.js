@@ -58,6 +58,28 @@ function _coerceUrl(u) {
   return null;
 }
 
+// NEW: 2025-08-28 — robust URL extraction across common job shapes.
+// Tries explicit fields first, then nested payloads, finally a JSON scan fallback.
+function _foldyExtractUrl(job) {
+  // Guard against null/primitive
+  if (!job || typeof job !== "object") return null;
+  // Preferred explicit fields
+  const direct =
+    _coerceUrl(job.url) ||
+    _coerceUrl(job.href);
+  if (direct) return direct;
+  // Common nested locations (e.g., n8n or RPC wrappers)
+  const nested =
+    _coerceUrl(job.payload) ||          // payload.url / payload.href / scan
+    _coerceUrl(job.data) ||             // data.url
+    _coerceUrl(job.job) ||              // job.url (wrapped)
+    _coerceUrl(job.target) ||           // target.url
+    null;
+  if (nested) return nested;
+  // Last resort: scan the whole object
+  return _coerceUrl(job);
+}
+
 // --- Persistent browser with periodic recycle
 let browser = null;
 let jobsSinceLaunch = 0;
@@ -100,9 +122,16 @@ async function processJob(job) {
   const ctx = await b.newContext(deviceOpts(job.device));
   const page = await ctx.newPage();
   try {
-    const targetUrl = _coerceUrl(job.url);
+    // MODIFIED: 2025-08-28 — extract URL from multiple shapes (direct, nested, fallback)
+    const targetUrl = _foldyExtractUrl(job);
     if (!targetUrl) {
-      throw new Error(`invalid_job_url: got ${typeof job.url} value=${JSON.stringify(job.url).slice(0,200)}`);
+      // Keep throw so existing catch updates status=error, but log with context first.
+      console.warn("[worker] discard job with invalid/missing URL", {
+        jobId: job?.id ?? null,
+        urlType: typeof job?.url,
+        hasPayload: !!job?.payload
+      });
+      throw new Error(`invalid_job_url: got ${typeof job?.url} value=${JSON.stringify(job?.url).slice(0,200)}`);
     }
     console.log(`[worker] processing ${job.id} attempt=${job.attempt} device=${job.device} url=${targetUrl}`);
 
