@@ -82,8 +82,19 @@ async function processJob(job) {
   const ctx = await b.newContext(deviceOpts(job.device));
   const page = await ctx.newPage();
   try {
-    // 1) Navigate
-    await page.goto(job.url, { waitUntil: "domcontentloaded", timeout: 25000 });
+
+    // 1) Navigate (harden URL type)
+    let targetUrl = null;
+    if (typeof job.url === "string") {
+      targetUrl = job.url;
+    } else if (job?.url && typeof job.url.url === "string") {
+      // Some enqueuers accidentally store the whole body as "url"
+      targetUrl = job.url.url;
+    } else {
+      throw new Error(`invalid_job_url: expected string, got ${typeof job.url}`);
+    }
+    await page.goto(targetUrl, { waitUntil: "domcontentloaded", timeout: 25000 });
+
     await page.waitForLoadState("networkidle", { timeout: 4000 }).catch(() => {});
     await page.waitForTimeout(500).catch(() => {});
 
