@@ -29,6 +29,23 @@ if (!RENDER_TOKEN) {
 const app = express();
 app.use(express.json({ limit: "1mb" }));
 
+// NEW: 2025-08-28 in-process concurrency gate to mimic container concurrency=1
+//      Keeps one /render active per process to avoid Chromium thrash under load.
+const MAX_INPROC_CONCURRENCY = parseInt(process.env.RENDER_CONCURRENCY || "1", 10);
+let _foldyActive = 0;
+const _foldyWaiters = [];
+async function _foldyAcquire() {
+  if (_foldyActive < MAX_INPROC_CONCURRENCY) { _foldyActive; return; }
+  await new Promise((res) => _foldyWaiters.push(res));
+  _foldyActive;
+}
+function _foldyRelease() {
+  _foldyActive = Math.max(0, _foldyActive - 1);
+  const next = _foldyWaiters.shift();
+  if (next) next();
+}
+
+
 /** ---------- Auth ---------- **/
 function authMiddleware(req, res, next) {
   const hdr = req.headers.authorization || "";
@@ -1133,6 +1150,7 @@ function hasCtaText(el) {
 app.get("/health", (_req, res) => res.json({ ok: true, up: true }));
 
 app.post("/render", authMiddleware, async (req, res) => {
+  await _foldyAcquire(); // NEW: serialize per-process renders
   res.setTimeout(HARD_TIMEOUT_MS + 5000);
   req.setTimeout?.(HARD_TIMEOUT_MS + 5000);
 
@@ -1308,15 +1326,6 @@ app.post("/render", authMiddleware, async (req, res) => {
     }
     // === /enqueue ===
 
-    // Clean screenshot
-    const shotStart = now();
-    await page.evaluate(async () => { if (document.fonts?.ready) await document.fonts.ready; });
-    const cleanPngBuf = await WT(
-      page.screenshot({ type: "png", fullPage: false, timeout: relaxed ? 0 : (SHOT_TIMEOUT_MS - 1000) }),
-      SHOT_TIMEOUT_MS,
-      "clean screenshot"
-    );
-    const shotEnd = now();
 
     // NEW: Pull CTA TTV (ms) from page (recorded by init script)
     let ctaTtvMs = await page.evaluate(() => (typeof window._foldyCtaTtvMs === "number" ? Math.max(0, Math.round(window._foldyCtaTtvMs)) : null));
@@ -1398,6 +1407,7 @@ app.post("/render", authMiddleware, async (req, res) => {
     console.error("Render error:", deviceKey, urlRaw, err?.message || err);
     return res.status(status).json({ error: String(err?.message || err) });
   } finally {
+    _foldyRelease(); // NEW
     try { await page?.close?.(); } catch {}
     try { await context?.close?.(); } catch {}
   }
