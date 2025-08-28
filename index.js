@@ -1305,13 +1305,15 @@ app.post("/render", authMiddleware, async (req, res) => {
       if (!supabase) {
         console.warn("[foldy] Supabase not configured; skipping screenshot job enqueue");
       } else {
+        // Coerce to a plain string; never store objects in job.url
+        const enqueueUrl = String(safeUrl || url || "");
         // Insert job as queued; the worker will process and upload later
         const { data: job, error: jobErr } = await supabase
           .from("screenshot_jobs")
           .insert({
             run_id,
             device: deviceKey,
-            url: safeUrl,
+            url: enqueueUrl,
             render_ts_ms: ts,
             status: "queued",
             screenshot_key,
