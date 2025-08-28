@@ -4,6 +4,7 @@ import express from "express";
 import { chromium } from "playwright";
 import dns from "node:dns/promises";
 import net from "node:net";
+import { createClient } from "@supabase/supabase-js";
 
 const PORT = process.env.PORT || 3000;
 const RENDER_TOKEN = process.env.RENDER_TOKEN;
@@ -37,6 +38,42 @@ function authMiddleware(req, res, next) {
   }
   next();
 }
+
+// Supabase Storage (server-side upload)
+const SUPABASE_URL = process.env.SUPABASE_URL;
+const SUPABASE_SERVICE_ROLE = process.env.SUPABASE_SERVICE_ROLE; // required
+const SUPABASE_BUCKET = process.env.SUPABASE_BUCKET || "screenshot";
+if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE) {
+  console.warn("[foldy] SUPABASE_URL / SUPABASE_SERVICE_ROLE not set – screenshot upload disabled");
+}
+const supabase = (SUPABASE_URL && SUPABASE_SERVICE_ROLE)
+  ? createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE, { auth: { persistSession: false } })
+  : null;
+
+// normalize object key folder from URL (keep your legacy style e.g. 'https:/domain')
+function _foldyKeyFrom(url, ts, device) {
+  try {
+    const u = new URL(url);
+    const hostPath = `${u.protocol.replace("://",":/")}${u.host}${u.pathname}`.replace(/\/+$/,''); // "https:/domain/path"
+    return `${hostPath}/${ts}-${device}.png`;
+  } catch {
+    // fallback for whatever string
+    const safe = url.replace(/[^a-z0-9:/._-]+/gi, "").replace(/\/+$/,'');
+    return `${safe}/${ts}-${device}.png`;
+  }
+}
+
+async function _foldyUploadScreenshot(key, buf) {
+  if (!supabase) throw new Error("supabase_not_configured");
+  const { error } = await supabase.storage.from(SUPABASE_BUCKET).upload(key, buf, {
+    contentType: "image/png",
+    upsert: true
+  });
+  if (error) throw error;
+  const { data } = supabase.storage.from(SUPABASE_BUCKET).getPublicUrl(key);
+  return data.publicUrl;
+}
+
 
 /** ---------- SSRF Guard ---------- **/
 const PRIVATE_CIDRS = [
@@ -1221,6 +1258,56 @@ app.post("/render", authMiddleware, async (req, res) => {
     const { ux, debugRects: rectsForDebug } = await WT(PAGE_EVAL.cleanAudit(page), 9000, "cleanAudit");
     const cleanEnd = now();
 
+    // === Screenshot job enqueue (before screenshot work) ===
+    let screenshot_key = null;
+    let screenshot_url = null;
+    let screenshot_job_id = null;
+    
+    try {
+      // Use current time for this request; payload is not built yet here
+      const ts = Date.now();
+    
+      // Build the storage key using the requested URL + timestamp + device
+      screenshot_key = _foldyKeyFrom(safeUrl, ts, deviceKey);
+    
+      // Precompute a public URL (optional, convenient for clients)
+      if (supabase) {
+        const { data } = supabase.storage.from(SUPABASE_BUCKET).getPublicUrl(screenshot_key);
+        screenshot_url = data.publicUrl;
+      }
+    
+      // Optional: forward a run_id from the request if present
+      const run_id = (req.body?.run_id || req.query?.run_id || null) || null;
+    
+      if (!supabase) {
+        console.warn("[foldy] Supabase not configured; skipping screenshot job enqueue");
+      } else {
+        // Insert job as queued; the worker will process and upload later
+        const { data: job, error: jobErr } = await supabase
+          .from("screenshot_jobs")
+          .insert({
+            run_id,
+            device: deviceKey,
+            url: safeUrl,
+            render_ts_ms: ts,
+            status: "queued",
+            screenshot_key,
+            screenshot_url
+          })
+          .select("*")
+          .single();
+    
+        if (jobErr) {
+          console.error("[foldy] failed to enqueue screenshot job:", jobErr);
+        } else {
+          screenshot_job_id = job.id;
+        }
+      }
+    } catch (e) {
+      console.warn("[foldy] enqueue screenshot job skipped:", e?.message || e);
+    }
+    // === /enqueue ===
+
     // Clean screenshot
     const shotStart = now();
     await page.evaluate(async () => { if (document.fonts?.ready) await document.fonts.ready; });
@@ -1262,7 +1349,10 @@ app.post("/render", authMiddleware, async (req, res) => {
 
       device: deviceKey,
       deviceMeta,
-      pngBase64: cleanPngBuf.toString("base64"),
+      // no inline base64; we return storage info + job id
+      screenshot_url: screenshot_url || null,
+      screenshot_key: screenshot_key || null,
+      screenshot_job_id: screenshot_job_id || null,
 
       ux: {
         ...ux,
