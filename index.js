@@ -35,9 +35,9 @@ const MAX_INPROC_CONCURRENCY = parseInt(process.env.RENDER_CONCURRENCY || "1", 1
 let _foldyActive = 0;
 const _foldyWaiters = [];
 async function _foldyAcquire() {
-  if (_foldyActive < MAX_INPROC_CONCURRENCY) { _foldyActive; return; }
+  if (_foldyActive < MAX_INPROC_CONCURRENCY) { _foldyActive++; return; }
   await new Promise((res) => _foldyWaiters.push(res));
-  _foldyActive;
+  _foldyActive++;
 }
 function _foldyRelease() {
   _foldyActive = Math.max(0, _foldyActive - 1);
@@ -1238,7 +1238,6 @@ app.post("/render", authMiddleware, async (req, res) => {
           timings: { nav_ms: ms(navStart, navEnd) },
           pngBase64: asSeenPngBuf ? asSeenPngBuf.toString("base64") : undefined
         };
-        try { await browser.close(); } catch {}
         return res.status(422).json(blockedPayload);
       }
     } catch (_) { /* ignore and proceed */ }
