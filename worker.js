@@ -103,7 +103,27 @@ async function claimJob() {
     console.error("[worker] claim error:", error);
     return null;
   }
-  return data;
+    // MODIFIED: 2025-08-28 — normalize claim shapes
+  // Possible shapes:
+  //  - null                        -> no job
+  //  - {}                          -> no job (treat as idle)
+  //  - [{...}]                     -> take first row
+  //  - { job: {...} }              -> unwrap job
+  //  - { id, url, ... }            -> job object
+  if (!data) return null;
+  if (Array.isArray(data)) {
+    if (data.length === 0) return null;
+    if (data.length > 1) console.warn("[worker] claim returned multiple rows; taking first");
+    return data[0];
+  }
+  if (typeof data === "object") {
+    if (Object.keys(data).length === 0) return null; // empty object => idle
+    if (data.job && typeof data.job === "object") return data.job; // unwrap wrapper
+    return data; // assume direct job shape
+  }
+  // Unexpected primitive -> treat as no job
+  console.warn("[worker] claim returned unexpected primitive:", typeof data);
+  return null;
 }
 
 async function uploadToStorage(key, buf) {
@@ -217,7 +237,15 @@ async function main() {
       console.error("[worker] claim threw:", e);
       job = null;
     }
-    if (!job) { await sleep(WORKER_SLEEP_MS); continue; }
+      // MODIFIED: 2025-08-28 — treat empty objects as idle to avoid poison loop
+      if (
+        !job ||
+        (typeof job === "object" && job !== null && Object.keys(job).length === 0)
+      ) {
+        // No work right now — small sleep to avoid hot loop
+        await sleep(WORKER_SLEEP_MS);
+        continue;
+      }
     await processJob(job);
   }
 }
