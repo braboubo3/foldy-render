@@ -71,14 +71,20 @@ const supabase = (SUPABASE_URL && SUPABASE_SERVICE_ROLE)
 function _foldyKeyFrom(url, ts, device) {
   try {
     const u = new URL(url);
-    const hostPath = `${u.protocol.replace("://",":/")}${u.host}${u.pathname}`.replace(/\/+$/,''); // "https:/domain/path"
-    return `${hostPath}/${ts}-${device}.png`;
+    const proto = u.protocol.replace(":", ""); // "https"
+    const host  = u.hostname;                  // "poslik.com"
+    const path  = (u.pathname || "").replace(/\/+$/, "");
+    // Enforce exactly one slash after colon: "https:/poslik.com[/path]/<ts>-<device>.png"
+    const base  = `${proto}:/${host}${path}`;
+    return `${base}/${ts}-${device}.png`;
   } catch {
-    // fallback for whatever string
-    const safe = url.replace(/[^a-z0-9:/._-]+/gi, "").replace(/\/+$/,'');
+    // Fallback: strip weird chars, enforce a slash after the first colon if present
+    let safe = String(url).replace(/[^a-z0-9:/._-]+/gi, "").replace(/\/+$/, "");
+    safe = safe.replace(/^([a-z]+:)(?!\/)/i, "$1/"); // ensure one slash after colon
     return `${safe}/${ts}-${device}.png`;
   }
 }
+
 
 async function _foldyUploadScreenshot(key, buf) {
   if (!supabase) throw new Error("supabase_not_configured");
