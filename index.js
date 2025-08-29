@@ -29,17 +29,20 @@ if (!RENDER_TOKEN) {
 const app = express();
 app.use(express.json({ limit: "1mb" }));
 
-// NEW: 2025-08-28 in-process concurrency gate to mimic container concurrency=1
-//      Keeps one /render active per process to avoid Chromium thrash under load.
-const MAX_INPROC_CONCURRENCY = parseInt(process.env.RENDER_CONCURRENCY || "1", 10);
+// NEW: 2025-08-29 concurrency gate (parallel contexts allowed)
+// Set RENDER_CONCURRENCY>0 to cap; set 0/negative to disable gating (unbounded).
+const MAX_INPROC_CONCURRENCY = parseInt(process.env.RENDER_CONCURRENCY || "3", 10);
+const _foldyConcEnabled = Number.isFinite(MAX_INPROC_CONCURRENCY) && MAX_INPROC_CONCURRENCY > 0;
 let _foldyActive = 0;
 const _foldyWaiters = [];
 async function _foldyAcquire() {
+  if (!_foldyConcEnabled) return;            // gating off → run immediately
   if (_foldyActive < MAX_INPROC_CONCURRENCY) { _foldyActive++; return; }
   await new Promise((res) => _foldyWaiters.push(res));
   _foldyActive++;
 }
 function _foldyRelease() {
+  if (!_foldyConcEnabled) return;
   _foldyActive = Math.max(0, _foldyActive - 1);
   const next = _foldyWaiters.shift();
   if (next) next();
@@ -1153,10 +1156,14 @@ function hasCtaText(el) {
 }; // <-- do not remove; closes PAGE_EVAL
 
 /** ---------- Routes ---------- **/
-app.get("/health", (_req, res) => res.json({ ok: true, up: true }));
+// MODIFIED: expose concurrency state for quick checks
+app.get("/health", (_req, res) => res.json({ ok: true, up: true, concurrency: MAX_INPROC_CONCURRENCY, active: _foldyActive }));
+
 
 app.post("/render", authMiddleware, async (req, res) => {
-  await _foldyAcquire(); // NEW: serialize per-process renders
+  await _foldyAcquire(); // allows N parallel contexts (or unlimited if gating off)
+  res.setHeader("X-Foldy-Concurrency", String(MAX_INPROC_CONCURRENCY));
+  res.setHeader("X-Foldy-Active", String(_foldyActive));
   res.setTimeout(HARD_TIMEOUT_MS + 5000);
   req.setTimeout?.(HARD_TIMEOUT_MS + 5000);
 
